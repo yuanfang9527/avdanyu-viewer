@@ -1,0 +1,13 @@
+# 数据目录：167MB 数据库超出 GitHub 100MB 单文件限制，且 zhipu-config.json 含 API Key
+avdanyu-data/
+
+# Python
+__pycache__/
+*.pyc
+
+# 日志
+*.log
+
+# 系统文件
+Thumbs.db
+.DS_Store

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>三站 iframe 内嵌正片测试</title>
+<style>
+  body { margin: 0; font: 14px sans-serif; background: #1e1e1e; color: #eee; }
+  .row { display: flex; flex-wrap: wrap; }
+  .card { width: 33%; min-width: 360px; box-sizing: border-box; padding: 6px; }
+  .card h3 { margin: 4px 0; font-size: 14px; }
+  iframe { width: 100%; height: 480px; border: 1px solid #555; background: #000; }
+  .log { white-space: pre-wrap; font: 12px monospace; color: #9fd; min-height: 18px; }
+</style>
+</head>
+<body>
+<div class="row">
+  <div class="card"><h3>1. MissAV (missav.ws/abp-985)</h3><div class="log" id="log1">加载中…</div>
+    <iframe id="f1" src="https://missav.ws/abp-985" referrerpolicy="no-referrer" allow="autoplay; fullscreen; encrypted-media" allowfullscreen></iframe></div>
+  <div class="card"><h3>2. 123av (123av.com/en/v/abp-985)</h3><div class="log" id="log2">加载中…</div>
+    <iframe id="f2" src="https://123av.com/en/v/abp-985" referrerpolicy="no-referrer" allow="autoplay; fullscreen; encrypted-media" allowfullscreen></iframe></div>
+  <div class="card"><h3>3. NjavTV (njav.tv/en/v/abp-985)</h3><div class="log" id="log3">加载中…</div>
+    <iframe id="f3" src="https://njav.tv/en/v/abp-985" referrerpolicy="no-referrer" allow="autoplay; fullscreen; encrypted-media" allowfullscreen></iframe></div>
+</div>
+<script>
+[['f1','log1'],['f2','log2'],['f3','log3']].forEach(([fid, lid]) => {
+  const f = document.getElementById(fid), log = document.getElementById(lid);
+  const t0 = Date.now();
+  f.addEventListener('load', () => { log.textContent = `load 事件触发 (${((Date.now()-t0)/1000).toFixed(1)}s)，跨域无法读取内容，需目测`; });
+  f.addEventListener('error', () => { log.textContent = 'error 事件触发'; });
+});
+setTimeout(() => ['log1','log2','log3'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el.textContent === '加载中…') el.textContent = '60s 内未触发 load（可能被 X-Frame-Options 拒绝）';
+}), 60000);
+</script>
+</body>
+</html>
