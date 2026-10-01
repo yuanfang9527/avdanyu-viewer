@@ -256,6 +256,31 @@
   #drawer .magnet-empty { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
   #drawer .magnet-status { margin: 0; color: var(--muted); font-size: 12px; }
 
+  /* ---------- JavDB 評論區（外站抓取，磁力面板下方可折叠面板） ---------- */
+  #drawer .cmt-panel { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 10px; background: var(--panel); }
+  #drawer .cmt-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  #drawer .cmt-panel:not(.open) .cmt-head { margin-bottom: 0; }
+  #drawer .cmt-head strong { color: var(--text); font-size: 13px; }
+  #drawer .cmt-panel:not(.open) #d-cmt-results { display: none; }
+  #drawer .cmt-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 0; background: none;
+    border: none; color: var(--text); cursor: pointer; }
+  #drawer .cmt-toggle:hover strong, #drawer .cmt-toggle:hover { color: var(--accent2); }
+  #drawer .cmt-toggle .tri { display: inline-block; width: 0; height: 0; border-left: 5px solid var(--faint);
+    border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform .15s ease; }
+  #drawer .cmt-panel.open .cmt-toggle .tri { transform: rotate(90deg); border-left-color: var(--accent2); }
+  #drawer .cmt-list { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow-y: auto; padding-right: 2px; }
+  #drawer .cmt-item { border-bottom: 1px dashed var(--line); padding-bottom: 8px; }
+  #drawer .cmt-item:last-child { border-bottom: none; padding-bottom: 0; }
+  #drawer .cmt-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); margin-bottom: 3px; }
+  #drawer .cmt-author { color: var(--accent2); font-weight: 600; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #drawer .cmt-score { color: #f5a623; font-weight: 700; }
+  #drawer .cmt-date { color: var(--faint); }
+  #drawer .cmt-text { font-size: 12.5px; line-height: 1.6; word-break: break-word; margin: 0; color: var(--text); }
+  #drawer .cmt-empty { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  #drawer .cmt-status { margin: 0; color: var(--muted); font-size: 12px; }
+  #drawer .cmt-src { font-size: 11px; color: var(--muted); margin: 0 0 8px; }
+
   /* ---------- 预告片本地播放浮层 ---------- */
   #drawer .ext-links button.extbtn { cursor: pointer; font: inherit; border: none; }
   #trailer-overlay { position: fixed; inset: 0; z-index: 600; background: rgba(8,12,16,.82);
@@ -4334,6 +4359,92 @@ function bindMagnetPanel(w) {
   if (refresh) refresh.addEventListener('click', () => loadWorkMagnets(w, true));
   loadWorkMagnets(w);   // 仅在详情抽屉打开（bindMagnetPanel 由抽屉渲染调用）时按需抓取一次；列表默认收起
 }
+/* ---------- JavDB 評論區：折叠面板懒加载，首次展开时经本地服务器抓取（搜索定位视频页 → 解析评论） ---------- */
+let _cmtLoadSeq = 0;
+function javdbPanelHTML() {
+  return `<section class="cmt-panel" id="d-cmt-panel">
+    <div class="cmt-head">
+      <button class="cmt-toggle" id="d-cmt-toggle" type="button" aria-expanded="false" title="展开 / 收起 JavDB 評論區（首次展开时自动加载）"><span class="tri"></span><strong>💬 JavDB 評論區 <span id="d-cmt-count"></span></strong></button>
+      <button class="rowbtn" id="d-cmt-refresh" type="button">重新抓取</button>
+    </div>
+    <div id="d-cmt-results"><p class="cmt-status">首次展开时从 JavDB 加载评论…</p></div>
+  </section>`;
+}
+function javdbResultsHTML(data) {
+  const items = data.items || [];
+  const note = (data.total > items.length) ? `<p class="cmt-src">共 ${data.total} 条，仅显示前 ${items.length} 条</p>` : '';
+  if (!items.length) {
+    const msg = data.notFound ? 'JavDB 没有收录此番号（搜索无匹配结果）。' : '这部作品在 JavDB 还没有评论。';
+    return `${note}<p class="cmt-empty">${msg}</p>`;
+  }
+  return `${note}<div class="cmt-list">${items.map(it => {
+    const meta = [
+      it.author ? `<span class="cmt-author">${esc(it.author)}</span>` : '',
+      it.score ? `<span class="cmt-score">★ ${esc(it.score)}</span>` : '',
+      it.date ? `<span class="cmt-date">${esc(it.date)}</span>` : '',
+    ].filter(Boolean).join('');
+    return `<div class="cmt-item">${meta ? `<div class="cmt-meta">${meta}</div>` : ''}<p class="cmt-text">${esc(it.text).replace(/\n/g, '<br>')}</p></div>`;
+  }).join('')}</div>`;
+}
+async function loadJavdbComments(w, force = false) {
+  const results = document.getElementById('d-cmt-results');
+  const refresh = document.getElementById('d-cmt-refresh');
+  const count = document.getElementById('d-cmt-count');
+  if (!results) return;
+  const requestSeq = ++_cmtLoadSeq;
+  const codes = workMagnetQueryCodes(w);
+  if (count) count.textContent = '';
+  if (!codes.length) {
+    results.innerHTML = '<p class="cmt-empty">这部作品没有可用于匹配的番号。</p>';
+    return;
+  }
+  results.innerHTML = `<p class="cmt-status">正在抓取 JavDB 評論區（${esc(codes[0])}）…</p>`;
+  if (force && refresh) refresh.disabled = true;
+  try {
+    let data = null, errStatus = 0;
+    for (const code of codes) {
+      try {
+        const resp = await relayFetch(`/__comments?q=${encodeURIComponent(code)}${force ? '&refresh=1' : ''}`);
+        if (!resp.ok) { errStatus = resp.status; throw new Error(`HTTP ${resp.status}`); }
+        data = await resp.json();
+      } catch (e) {
+        data = null;
+        break;
+      }
+      if (requestSeq !== _cmtLoadSeq || drawer.dataset.workId !== favId(w)) return;
+      if (!data.ok) break;   // 服务端错误（地区封锁/网络不可达等）直接展示
+      if ((data.items && data.items.length) || data.notFound) break;   // 命中评论或确认未收录
+      if (code === codes[codes.length - 1]) break;   // 最后一个候选番号：有视频页但无评论也算结果
+    }
+    if (requestSeq !== _cmtLoadSeq || drawer.dataset.workId !== favId(w)) return;
+    if (!data) {
+      results.innerHTML = errStatus === 403
+        ? '<p class="cmt-empty">评论接口鉴权失败：请刷新页面后重试。</p>'
+        : '<p class="cmt-empty">评论接口不可用：请通过 start-viewer.bat（scripts/avdanyu-server.py）启动查看器。</p>';
+    } else if (!data.ok) {
+      results.innerHTML = `<p class="cmt-empty">JavDB 抓取失败：${esc(data.error || '未知错误')}</p>`;
+    } else {
+      const n = (data.items || []).length;
+      if (count) count.textContent = `（${data.total || n || 0}）`;
+      results.innerHTML = javdbResultsHTML(data);
+    }
+  } finally {
+    if (requestSeq === _cmtLoadSeq && refresh?.isConnected) refresh.disabled = false;
+  }
+}
+function bindJavdbPanel(w) {
+  const panel = document.getElementById('d-cmt-panel');
+  const toggle = document.getElementById('d-cmt-toggle');
+  if (!panel || !toggle) return;
+  let loaded = false;
+  toggle.addEventListener('click', () => {
+    const open = panel.classList.toggle('open');
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open && !loaded) { loaded = true; loadJavdbComments(w); }   // 懒加载：避免每次开抽屉都请求外站
+  });
+  const refresh = document.getElementById('d-cmt-refresh');
+  if (refresh) refresh.addEventListener('click', () => { loaded = true; loadJavdbComments(w, true); });
+}
 /* ---------- 预告片本地播放：经本地服务器解析 FANZA 试看直链（带签名 token，多画质） ---------- */
 let _trailerItems = [];
 let _trailerIdx = -1;
@@ -4644,6 +4755,7 @@ function openDrawer(w, pushHistory = false) {
     </div>
     <div class="d-poster">${poster}</div>
     ${magnetPanelHTML()}
+    ${javdbPanelHTML()}
     <div class="d-fields">${
       [
         ['', personField('出演者', w.actresses, 's-actress', 'f')],
@@ -4791,6 +4903,7 @@ function openDrawer(w, pushHistory = false) {
     closeDrawer();
   });
   bindMagnetPanel(w);
+  bindJavdbPanel(w);
   bindTrailerButton(w);
   bindOnlinePlayButton(w);
   drawer.classList.add('on');

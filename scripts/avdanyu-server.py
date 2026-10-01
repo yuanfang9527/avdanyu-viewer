@@ -5,6 +5,7 @@
 - POST /__translate：{texts: [...], from: "ja", to: "zh-CN"} → 优先智谱 GLM 模型翻译（需配置 API Key），
   失败时降级 curl_cffi / Google 免费端点，最后兜底 MyMemory
 - GET /__magnets?q=番号[&refresh=1]：按番号搜索外站磁力（sukebei 主源，btdig 备源），内存缓存 30 分钟
+- GET /__comments?q=番号[&refresh=1]：JavDB 評論區抓取（搜索定位视频页 → 解析评论），内存缓存 30 分钟
 - GET /__trailer?cid=番号[&refresh=1]：解析 FANZA 试看片直链（多画质，带签名 token），内存缓存 1 小时
 - GET /__online-player?code=番号：解析 javday 播放源（搜索番号 → 视频页 → m3u8 直链，多线路），
   内存缓存 30 分钟
@@ -669,6 +670,309 @@ def fetch_remote_magnets(q, refresh=False):
     return result
 
 
+# ==================== JavDB 評論區抓取（详情抽屉「JavDB 評論區」数据源） ====================
+# 流程：番号 -> JavDB 搜索页(/search?q=番号&f=all)取第一个标题以番号开头的 /v/ 短链
+#       -> 视频页解析評論區（Reviews 标签面板，服务端渲染在页面 HTML 里）。
+# 注意：JavDB 屏蔽日本/韩国等地区出口 IP（返回「版權限制」页），而预告片（FANZA）又需要日本出口：
+#       两者分流解决 —— JavDB 请求独立挑选出口（详见下方「JavDB 专用出口选择」），其余功能不受影响；
+#       域名轮换频繁，默认依次尝试 javdb.com 与页脚公示的当前官方域名，可用环境变量
+#       AVDANYU_JAVDB_HOSTS 覆盖（逗号分隔）。
+JAVDB_CACHE_TTL = 1800            # 内存缓存 30 分钟；「重新抓取」带 refresh=1 绕过
+_javdb_cache = {}                 # 番号大写 -> (写入时间戳, result)
+_javdb_cache_lock = threading.Lock()
+
+_JAVDB_DOC_HEADERS = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Cache-Control': 'no-cache', 'Pragma': 'no-cache',
+    'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1', 'Upgrade-Insecure-Requests': '1',
+    'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not.A/Brand";v="24"',
+    'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"Windows"',
+    'Cookie': 'over18=1; locale=zh_CN',   # 年龄墙为弹层，带 over18 即可；zh_CN 输出简体中文界面
+}
+
+
+def _javdb_hosts():
+    raw = os.environ.get('AVDANYU_JAVDB_HOSTS', 'javdb.com,javdb580.com')
+    return [h.strip() for h in raw.split(',') if h.strip()] or ['javdb.com']
+
+
+# ---- JavDB 专用出口选择 ----
+# JavDB 屏蔽日本/韩国等地区出口，而预告片（FANZA）恰恰需要日本出口：单一全局节点无法两全。
+# 因此 JavDB 请求独立挑选出口，其余功能（磁力/预告片/在线播放）仍走原有全局代理逻辑，互不影响：
+# 1) 环境变量 AVDANYU_JAVDB_PROXY 显式指定的代理（如另一个走港/台/美节点的本机端口）最优先；
+# 2) 否则依次尝试 直连 + 本机常见代理端口。地区封锁页 / Cloudflare 验证页同样视为「该出口不可用」
+#    并换下一个出口 —— 普通代理逻辑拿到 HTML 即算成功，感知不到这种封锁；
+# 3) 可用出口与被封锁出口均记忆 10 分钟，避免每次请求全量试探。
+JAVDB_EXIT_RETRY = 600
+_javdb_exit_lock = threading.Lock()
+_javdb_exit_state = {'ok': None, 'bad': {}}   # bad: 出口 -> 标记时间
+
+
+def _javdb_exit_candidates():
+    out = []
+    env = os.environ.get('AVDANYU_JAVDB_PROXY', '').strip()
+    if env:
+        out.append(env)
+    out.append('')                    # 直连（TUN/全局代理模式下即全局出口）
+    seen = set(out)
+    extra = []
+    if os.environ.get('AVDANYU_PROXY', '').strip():
+        extra.append(os.environ['AVDANYU_PROXY'].strip())
+    extra += ['http://127.0.0.1:%d' % p for p in (7897, 7890, 7891, 10809)]
+    for p in extra:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _javdb_exit_label(exit_proxy):
+    if not exit_proxy:
+        return '直连'
+    env = os.environ.get('AVDANYU_JAVDB_PROXY', '').strip()
+    return 'AVDANYU_JAVDB_PROXY' if exit_proxy == env else exit_proxy
+
+
+def _javdb_fetch_once(url, headers, exit_proxy):
+    """单出口抓取。返回 (text|None, kind, err)：kind = ok / blocked / challenge / error。"""
+    text, err = _http_once(url, 15, headers, exit_proxy)
+    if text is None:
+        return None, 'error', (err or '无响应')
+    if '版權限制' in text or 'copyright restrictions' in text[:800].lower():
+        return None, 'blocked', '地区封锁'
+    if 'Just a moment' in text[:600] or 'challenge-platform' in text[:2000]:
+        return None, 'challenge', 'Cloudflare 人机验证'
+    return text, 'ok', ''
+
+
+def _javdb_get(path, referer=None):
+    """JavDB 专用 GET：跨「出口 × 域名」尝试。地区封锁按出口 IP 生效，换域名无用，只换出口；
+    返回 (host, text|None, error)。"""
+    headers = dict(_JAVDB_DOC_HEADERS)
+    if referer:
+        headers['Referer'] = referer
+
+    def probe():
+        """一轮完整试探。返回 (host|None, text|None, notes, any_gated)。"""
+        now = time.time()
+        with _javdb_exit_lock:
+            ok_exit = _javdb_exit_state['ok']
+            bad = {e for e, ts in _javdb_exit_state['bad'].items() if now - ts < JAVDB_EXIT_RETRY}
+        exits = ([ok_exit] if ok_exit is not None else []) + \
+                [e for e in _javdb_exit_candidates() if e != ok_exit]
+        notes, gated = [], False
+        for exit_proxy in exits:
+            if exit_proxy in bad:
+                continue
+            for host in _javdb_hosts():
+                text, kind, err = _javdb_fetch_once('https://' + host + path, headers, exit_proxy)
+                if kind == 'ok':
+                    with _javdb_exit_lock:
+                        _javdb_exit_state['ok'] = exit_proxy
+                        _javdb_exit_state['bad'].pop(exit_proxy, None)
+                    return host, text, notes, gated
+                label = _javdb_exit_label(exit_proxy) + '/' + host
+                if kind in ('blocked', 'challenge'):
+                    gated = True
+                    notes.append(f'{label}: {err}')
+                    break   # 封锁按出口 IP 生效：同出口换域名无用，换下一个出口
+                notes.append(f'{label}: {err[:80]}')   # 网络错误可能是域名级（SNI 阻断）：同出口换下一个域名
+            with _javdb_exit_lock:
+                _javdb_exit_state['bad'][exit_proxy] = time.time()
+                if _javdb_exit_state['ok'] == exit_proxy:
+                    _javdb_exit_state['ok'] = None
+        return None, None, notes, gated
+
+    host, text, notes, any_gated = probe()
+    if text is not None:
+        return host, text, ''
+    if not notes:
+        # 全部出口被近期的坏出口记忆跳过：「重新抓取」应当真的重试 —— 清空记忆再完整试一轮
+        with _javdb_exit_lock:
+            _javdb_exit_state['bad'] = {}
+        host, text, notes, any_gated = probe()
+        if text is not None:
+            return host, text, ''
+    if any_gated:
+        tip = ('JavDB 屏蔽了全部已尝试出口（' + '、'.join(notes[:4]) + '）。'
+               'JavDB 拒绝日本/韩国出口，而预告片又需要日本节点，两者需分流，任选其一：'
+               '① 在 Clash 等工具中为 javdb.com 与 javdb580.com 添加分流规则，指向香港/台湾/新加坡/美国等节点'
+               '（磁力、预告片等其他功能不受影响）；'
+               '② 设置环境变量 AVDANYU_JAVDB_PROXY 指向一个非日韩出口的本机代理端口；'
+               '③ 本机若有多个代理端口，服务器会自动逐个试探，无需配置。')
+        return None, None, tip
+    return None, None, ('javdb: 所有出口均不可达：' + '；'.join(notes[:4]))[:300]
+
+
+def _javdb_code_compact(code):
+    return re.sub(r'[^0-9a-z]', '', (code or '').lower())
+
+
+def _javdb_find_video(search_page, code):
+    """搜索结果页 -> 第一个标题以番号开头的 /v/ 短链与标题（相关度排序下精确匹配排最前）。
+    只认标题前缀匹配，避免 ABP-769 误配 ABP-7690 之类的邻号。"""
+    want = _javdb_code_compact(code)
+    if not want:
+        return '', ''
+    for href, inner in re.findall(r'<a[^>]+href="(/v/[A-Za-z0-9]+)"[^>]*>(.*?)</a>', search_page, re.S):
+        card = html.unescape(re.sub(r'<[^>]+>', ' ', inner))
+        # 卡片文本以番号开头（番号总在标题最前）；标题以外的日期/评分文本不影响前缀判断
+        if not _javdb_code_compact(card)[:64].startswith(want):
+            continue
+        tm = re.search(r'class="[^"]*(?:video-title|current-title)[^"]*"[^>]*>([^<]*)', inner)
+        return href, (html.unescape(tm.group(1)).strip() if tm else card.strip()[:150])
+    return '', ''
+
+
+def _javdb_clean_text(s):
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', s))).strip()
+
+
+def _javdb_item_fields(chunk):
+    """单条评论块 -> (author, score, date)。真实结构：作者名/星级/日期都在 review-title 的直接文本里，
+    检举与点赞按钮藏在嵌套 form 中，星级用 icon-star 图标表示（gray 类为灰星占位，不计入评分）。"""
+    author = ''
+    am = re.search(r'class="review-title"[^>]*>(.*?)<div[^>]*class="content"', chunk, re.S)
+    if am:
+        head = re.sub(r'<form[^>]*>.*?</form>', ' ', am.group(1), flags=re.S)
+        head = re.sub(r'<span[^>]*class="score-stars"[^>]*>.*?</span>', ' ', head, flags=re.S)
+        head = re.sub(r'<span[^>]*class="time"[^>]*>.*?</span>', ' ', head, flags=re.S)
+        head = re.sub(r'<[^>]+>', ' ', head)
+        author = re.sub(r'\s+', ' ', html.unescape(head).replace('\xa0', ' ')).strip()
+    if not author:
+        fm = re.search(r'<a[^>]*href="/users/[^"]*"[^>]*>(.*?)</a>', chunk, re.S)
+        if fm:
+            author = _javdb_clean_text(fm.group(1))
+    tm = (re.search(r'<span[^>]*class="time"[^>]*>([^<]+)</span>', chunk)
+          or re.search(r'<time[^>]*>([^<]+)</time>', chunk)
+          or re.search(r'<time[^>]*datetime="([^"]+)"', chunk)
+          or re.search(r'\b(\d{4}-\d{2}-\d{2})\b', chunk))
+    date = _javdb_clean_text(tm.group(1)) if tm else ''
+    sm = (re.search(r'data-score="([\d.]+)"', chunk)
+          or re.search(r'(\d+(?:\.\d+)?)\s*分', chunk))
+    score = sm.group(1) if sm else ''
+    if not score:
+        # 亮星数（class 含 gray 的 icon-star 是灰星占位，必须排除）；个别模板用 ★ 字形
+        lit = len(re.findall(r'<i[^>]*class="icon-star(?![^"]*gray)[^"]*"', chunk))
+        if 0 < lit <= 10:
+            score = str(lit)
+        else:
+            stars = len(re.findall('[★⭐]', re.sub(r'<[^>]+>', '', chunk)))
+            if 0 < stars <= 10:
+                score = str(stars)
+    return author[:60], score, date[:20]
+
+
+def _javdb_item_text(chunk):
+    """评论正文：JavDB 正文在 div.content 的 <p> 段落里；兜底做全块去噪取文本。"""
+    ps = re.findall(r'<div[^>]*class="content"[^>]*>(.*?)</div>', chunk, re.S)
+    if ps:
+        paras = []
+        for p in re.findall(r'<p[^>]*>(.*?)</p>', ps[0], re.S) or [ps[0]]:
+            t = _javdb_clean_text(_javdb_strip_noise(p))
+            if t:
+                paras.append(t)
+        if paras:
+            return '\n\n'.join(paras)[:4000]
+    return _javdb_clean_text(_javdb_strip_noise(chunk))[:4000]
+
+
+def _javdb_strip_noise(c):
+    """去掉头像/作者/时间/星级/按钮等非正文标记（对任意片段复用）。"""
+    c = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', c, flags=re.S | re.I)
+    c = re.sub(r'<img[^>]*>', ' ', c)
+    c = re.sub(r'<i[^>]*class="[^"]*icon-star[^"]*"[^>]*>.*?</i>', ' ', c, flags=re.S)
+    c = re.sub(r'<a[^>]*href="/users/[^"]*"[^>]*>.*?</a>', ' ', c, flags=re.S)
+    c = re.sub(r'<span[^>]*class="(?:time|likes-count|score)[^"]*"[^>]*>.*?</span>', ' ', c, flags=re.S)
+    c = re.sub(r'<time[^>]*>.*?</time>', ' ', c, flags=re.S)
+    # 按钮（回覆/檢舉/讚等）多为无实义 href 的锚点或 button；正文里的真链接极少，整体去掉
+    c = re.sub(r'<a[^>]*href="(?:#|javascript:)[^"]*"[^>]*>.*?</a>', ' ', c, flags=re.S | re.I)
+    c = re.sub(r'<(button|form)[^>]*>.*?</\1>', ' ', c, flags=re.S | re.I)
+    return c
+
+
+def _javdb_parse_review_items(frag):
+    """评论列表片段（/reviews/lastest 或视频页内嵌）-> 评论列表。
+    每条评论为 dt.review-item（视频页整体结构里也可能以 article 出现，一并兼容）。"""
+    items = []
+    parts = re.split(r'(?=<dt[^>]*class="[^"]*review-item[^"]*"|<article\b)', frag)[1:]
+    for chunk in parts:
+        chunk = chunk[:30000]
+        if 'panel-heading' in chunk[:500]:
+            continue                      # 区块容器，非评论
+        # 切分按下一个评论起点边界：截到本条自身的闭合标签，避免吞进后续区块
+        end = min([p for p in (chunk.find('</dt>'), chunk.find('</article>'), chunk.find('<footer'),
+                               chunk.find('related'), chunk.find('block-comments')) if p > 0] or [len(chunk)])
+        own = chunk[:end] if end > 0 else chunk
+        author, score, date = _javdb_item_fields(own)
+        text = _javdb_item_text(own)
+        if not text or not (author or date):
+            continue                      # 无正文或缺少作者与日期的块不是评论
+        items.append({'author': author[:60], 'score': score, 'date': date[:20], 'text': text})
+    return items
+
+
+def _javdb_parse_comments(page):
+    """视频页 -> (评论总数, 评论列表)。总数取自 Reviews 标签（評論 (N)），列表复用评论项解析。"""
+    total = None
+    cm = re.search(r'(?:評論|评论|Reviews?)\s*[(（]\s*(\d+)\s*[)）]', page)
+    if cm:
+        total = int(cm.group(1))
+    return total, _javdb_parse_review_items(page)
+
+
+def fetch_javdb_comments(q, refresh=False):
+    q = (q or '').strip()
+    if not q or len(q) > 64:
+        return {'ok': False, 'error': '缺少或非法的番号参数'}
+    cache_key = q.upper()
+    if not refresh:
+        hit = _javdb_cache.get(cache_key)
+        if hit and time.time() - hit[0] < JAVDB_CACHE_TTL:
+            return {'ok': True, 'cached': True, **hit[1]}
+    host, page, err = _javdb_get('/search?q=' + urllib.parse.quote(q) + '&f=all')
+    if page is None:
+        return {'ok': False, 'error': err[:600]}
+    href, title = _javdb_find_video(page, q)
+    if not href:
+        if '/v/' not in page:
+            return {'ok': False, 'error': 'javdb: 搜索页无任何结果卡片，疑似页面结构变化或被拦截（详见服务器日志）'}
+        # 搜索正常但没有番号匹配：JavDB 未收录，同样写缓存避免反复请求
+        result = {'q': q, 'videoUrl': '', 'videoTitle': '', 'total': 0, 'items': [], 'notFound': True}
+        with _javdb_cache_lock:
+            _javdb_cache[cache_key] = (time.time(), result)
+        return {'ok': True, 'cached': False, **result}
+    video_url = 'https://' + (host or 'javdb.com') + href
+
+    # 评论走专用片段端点（视频页 Reviews 面板 AJAX 同源；未登录可读，结尾带登录提示文案）
+    frag_host, frag, err2 = _javdb_get(href + '/reviews/lastest', referer=video_url)
+    items = _javdb_parse_review_items(frag) if frag else []
+    total = None
+    # 评论端点失败或为空时回退解析视频页；有评论时也取一次视频页拿「評論 (N)」总数
+    host2, vpage, err3 = _javdb_get(href, referer=video_url)
+    if vpage is not None:
+        page_total, page_items = _javdb_parse_comments(vpage)
+        total = page_total
+        if not items:
+            items = page_items
+    elif frag is None:
+        log(f'javdb 视频页与评论端点均不可达（{q}）：{err2[:80]} / {err3[:80]}')
+    result = {
+        'q': q,
+        'videoUrl': video_url,
+        'videoTitle': title,
+        'total': total if total is not None else len(items),
+        'items': items,
+    }
+    if total and not items:
+        log(f'javdb 评论总数 {total} 但未解析到条目（{q}），页面结构可能已变化')
+    with _javdb_cache_lock:
+        _javdb_cache[cache_key] = (time.time(), result)
+    return {'ok': True, 'cached': False, **result}
+
+
 # ==================== FANZA 预告片解析（详情抽屉「预告片」本地播放） ====================
 # 流程：cid -> FANZA html5_player 页面（需年龄验证 Cookie）-> 解析内嵌 JSON 的 bitrates 数组
 #       -> 得到带签名 token 的 cc3001.dmm.co.jp/pv/ 直链（可直接热链播放，无需 Referer）。
@@ -877,6 +1181,15 @@ class Handler(SimpleHTTPRequestHandler):
             q = (qs.get('q') or [''])[0]
             refresh = (qs.get('refresh') or [''])[0] in ('1', 'true')
             out = json.dumps(fetch_remote_magnets(q, refresh), ensure_ascii=False)
+            return self._send_json(200, out)
+        if self.path.split('?', 1)[0] == '/__comments':
+            # 与 /__magnets 同理：触发对外请求，需同源令牌防跨站滥用
+            if not self._token_ok():
+                return self._send_json(403, json.dumps({'ok': False, 'error': 'forbidden: missing or invalid token'}))
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            q = (qs.get('q') or [''])[0]
+            refresh = (qs.get('refresh') or [''])[0] in ('1', 'true')
+            out = json.dumps(fetch_javdb_comments(q, refresh), ensure_ascii=False)
             return self._send_json(200, out)
         if self.path.split('?', 1)[0] == '/__trailer':
             # 与 /__magnets 同理：同源令牌防跨站滥用

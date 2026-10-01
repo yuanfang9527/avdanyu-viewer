@@ -4,9 +4,12 @@
 
 作品详情中的磁力链接由 `avdanyu-server.py` 的 `GET /__magnets` 接口实时抓取外站，仅在打开作品详情时按番号查询，结果内存缓存 30 分钟；不再读取本地的 `avdanyu-data/magnets.json`。源顺序：sukebei（.si → .net 镜像）→ JavBus（备源）→ btdig（.com → .co）；直连被墙时自动经本机代理（`AVDANYU_PROXY` 可指定）重试。
 
+作品详情中的 JavDB 評論區由 `GET /__comments` 接口抓取：番号搜索定位视频页 → 评论片段端点（`/v/{id}/reviews/lastest`，视频页解析兜底）→ 解析作者/评分/日期/正文，内存缓存 30 分钟。JavDB 屏蔽日本/韩国出口而预告片（FANZA）又需要日本出口，两者按目标站点分出口：JavDB 请求独立挑选出口（`AVDANYU_JAVDB_PROXY` 显式指定 > 直连与本机常见代理端口逐个试探，地区封锁/CF 验证页视为出口不可用，可用出口记忆 10 分钟），磁力/预告片/在线播放仍走原有全局代理逻辑；域名可用环境变量 `AVDANYU_JAVDB_HOSTS` 覆盖。
+
 | 文件 | 用途 | 什么时候需要 |
 | --- | --- | --- |
-| `avdanyu-server.py` | 提供本地网页、数据库和译文同步接口，中继标题翻译请求，中继外站磁力搜索（`/__magnets`），解析 FANZA 预告片直链（`/__trailer`） | 每次通过 `start-viewer.bat` 启动时 |
+| `avdanyu-server.py` | 提供本地网页、数据库和译文同步接口，中继标题翻译请求，中继外站磁力搜索（`/__magnets`）与 JavDB 評論區抓取（`/__comments`），解析 FANZA 预告片直链（`/__trailer`） | 每次通过 `start-viewer.bat` 启动时 |
+| `test_javdb_comments.py` | JavDB 評論區解析器单元测试（离线，喂合成/真实片段 HTML，含根目录 `javdb_geo_block.html` 地区封锁页 fixture）；`python scripts/test_javdb_comments.py` | 修改评论解析逻辑后 |
 | `sql-wasm.js`、`sql-wasm.wasm` | 浏览器读取 `avdanyu.db` 所需的 SQLite 引擎，两个文件须配套保留 | 打开数据库时 |
 | `avdanyu-exporter.user.js` | 浏览器油猴脚本，从来源网站导出月度作品文件；不由查看器自动执行 | 抓取或更新作品数据时 |
 | `avdanyu-merge.py` | 把月度 `.txt` 文件整合进 `avdanyu-data/avdanyu.db`，并保留已有封面 | 导入新月度数据时 |
