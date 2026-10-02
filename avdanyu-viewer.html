@@ -220,10 +220,45 @@
   #online-srcs button.on { color: #fff; background: var(--accent); border-color: var(--accent); }
   #online-video { display: block; width: 100%; aspect-ratio: 16/9; max-height: 74vh; background: #000;
     border-radius: 8px; border: none; }
+  /* 字幕去黑底：浏览器默认给 cue 加半透明黑块，改为纯白字 + 深色描边阴影保可读 */
+  #online-video::cue { background-color: transparent; color: #fff;
+    text-shadow: 0 0 4px rgba(0,0,0,.95), 0 1px 3px rgba(0,0,0,.85), 0 -1px 3px rgba(0,0,0,.85); }
   #online-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px;
     margin-top: 8px; color: var(--muted); font-size: 12px; min-height: 22px; flex-wrap: wrap; }
   #online-foot a { color: var(--accent2); text-decoration: none; }
   #online-foot a:hover { text-decoration: underline; }
+  /* 字幕：头部入口按钮 + 视频下方候选面板 */
+  #online-sub-btn { flex: 0 0 auto; background: var(--panel2); color: var(--muted); border: 1px solid var(--line);
+    border-radius: 7px; padding: 2px 9px; font-size: 12px; font-weight: 600; cursor: pointer; }
+  #online-sub-btn:hover { color: var(--text); border-color: var(--accent2); }
+  #online-sub-btn.on { color: #fff; background: var(--accent); border-color: var(--accent); }
+  #online-sub-panel { margin-top: 8px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel2); padding: 8px 10px; }
+  #online-sub-panel[hidden] { display: none; }
+  .online-sub-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+  .online-sub-bar strong { color: var(--text); font-size: 12.5px; flex: 0 0 auto; }
+  #online-sub-status { color: var(--muted); font-size: 12px; flex: 1; min-width: 120px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .online-sub-ops { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+  .online-sub-ops button { background: var(--panel); color: var(--muted); border: 1px solid var(--line);
+    border-radius: 7px; padding: 2px 8px; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+  .online-sub-ops button:hover { color: var(--text); border-color: var(--accent2); }
+  #online-sub-offset { color: var(--muted); font-size: 11.5px; min-width: 36px; text-align: center; font-weight: 600; }
+  #online-sub-list { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; }
+  #online-sub-list:empty { display: none; }
+  .online-sub-row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border: 1px solid transparent;
+    border-radius: 7px; cursor: pointer; }
+  .online-sub-row:hover { border-color: var(--line); background: var(--panel); }
+  .online-sub-row.on { border-color: var(--accent); background: var(--panel); }
+  .online-sub-name { color: var(--text); font-size: 12px; flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .online-sub-tag { flex: 0 0 auto; font-size: 10.5px; font-weight: 700; border-radius: 8px;
+    padding: 0 6px; line-height: 16px; }
+  .online-sub-tag.cn { color: #ff6b6b; background: rgba(255,107,107,.10); border: 1px solid rgba(255,107,107,.55); }
+  .online-sub-tag.dur { color: var(--muted); background: var(--panel); border: 1px solid var(--line); }
+  .online-sub-tag.match { color: var(--accent2); background: var(--panel); border: 1px solid var(--accent2); }
+  .online-sub-dl { flex: 0 0 auto; color: var(--accent2); font-size: 11.5px; text-decoration: none; }
+  .online-sub-dl:hover { text-decoration: underline; }
 
   /* ---------- 磁力资源（外站抓取，封面下方可折叠面板） ---------- */
   #drawer .magnet-panel { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line);
@@ -796,9 +831,24 @@
       <strong id="online-title">在线播放</strong>
       <span id="online-cn" hidden title="该片源带中文字幕（多版本时已优先选择）">中字</span>
       <span id="online-srcs" hidden></span>
+      <button id="online-sub-btn" type="button" title="搜索并挂载字幕（迅雷字幕库·网友上传）">字幕</button>
       <button class="rowbtn" id="online-close" type="button">✕ 关闭</button>
     </div>
     <video id="online-video" controls playsinline preload="none" crossorigin="anonymous"></video>
+    <div id="online-sub-panel" hidden>
+      <div class="online-sub-bar">
+        <strong>字幕</strong>
+        <span id="online-sub-status"></span>
+        <span class="online-sub-ops">
+          <button id="online-sub-off" type="button" title="取消当前挂载的字幕">✕ 关闭字幕</button>
+          <button id="online-sub-earlier" type="button" title="字幕整体提前 0.5 秒">−0.5s</button>
+          <b id="online-sub-offset">0.0s</b>
+          <button id="online-sub-later" type="button" title="字幕整体延后 0.5 秒">+0.5s</button>
+          <button id="online-sub-refresh" type="button" title="重新搜索字幕（跳过缓存）">↻ 刷新</button>
+        </span>
+      </div>
+      <div id="online-sub-list"></div>
+    </div>
     <div id="online-foot">
       <span id="online-status">正在解析播放源…</span>
       <span class="online-links">
@@ -4557,6 +4607,7 @@ function onlinePlayCode(w) {
 let _onlineSources = [];       // 当前作品的播放线路（m3u8 地址）
 let _onlineReqSeq = 0;        // 序号防竞态：快速连续打开时旧请求结果作废
 let _onlineHls = null;        // 当前 hls.js 实例（切换线路/关闭时销毁）
+let _onlineCode = '';         // 当前作品番号（字幕搜索用）
 function destroyOnlineHls() {
   if (_onlineHls) {
     try { _onlineHls.destroy(); } catch (e) { /* 已销毁 */ }
@@ -4573,6 +4624,7 @@ function playOnlineSource(idx) {
   try { video.pause(); } catch (e) {}
   video.removeAttribute('src');
   video.load();
+  ensureSubShown();   // 切换线路后恢复字幕显示（load() 会重置轨道状态）
   const localPlaylist = `/__online-m3u8?u=${encodeURIComponent(src.url)}`;
   if (window.Hls && Hls.isSupported()) {
     const hls = new Hls({
@@ -4615,6 +4667,8 @@ function openOnlinePlayer(code, title) {
   video.volume = 0.3;          // 默认音量 30%，仍可用播放器音量条调节
   video.removeAttribute('poster');
   destroyOnlineHls();
+  _onlineCode = code;
+  resetSubtitleState();        // 新作品：清空已挂载字幕与面板状态
   overlay.hidden = false;
   resolveOnlinePlayer(code);
 }
@@ -4676,6 +4730,7 @@ function closeOnlinePlayer() {
   _onlineReqSeq++;             // 使在途解析结果作废
   _onlineSources = [];
   destroyOnlineHls();
+  resetSubtitleState();        // 移除字幕 track、回收 blob、重置面板
   const overlay = document.getElementById('online-overlay');
   const video = document.getElementById('online-video');
   if (video) {
@@ -4694,7 +4749,241 @@ function closeOnlinePlayer() {
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && !overlay.hidden) { e.stopImmediatePropagation(); closeOnlinePlayer(); }
   });
+  const subBtn = document.getElementById('online-sub-btn');
+  if (subBtn) subBtn.addEventListener('click', toggleSubPanel);
+  const subOff = document.getElementById('online-sub-off');
+  if (subOff) subOff.addEventListener('click', () => clearSubtitle());
+  const subEarlier = document.getElementById('online-sub-earlier');
+  if (subEarlier) subEarlier.addEventListener('click', () => applySubOffset(-500));
+  const subLater = document.getElementById('online-sub-later');
+  if (subLater) subLater.addEventListener('click', () => applySubOffset(500));
+  const subRefresh = document.getElementById('online-sub-refresh');
+  if (subRefresh) subRefresh.addEventListener('click', () => { if (_onlineCode) searchSubtitles(_onlineCode, true); });
 })();
+
+/* ---------- 在线播放字幕：迅雷字幕库搜索（网友上传 srt）→ 本地服务转 WebVTT → <track> 挂载 ----------
+   字幕经 /__subtitles 搜索、/__subtitle-file 下载转换（同源+令牌），前端拿 VTT 文本后
+   以 blob URL 挂到 <track>（track 元素无法携带鉴权头，不能直接把本地端点设为其 src）；
+   切换播放线路会触发 video.load() 重置轨道，由 track 的 load 事件恢复显示与累计偏移。 */
+let _subItems = [];           // 当前作品的字幕候选
+let _subLoadedCode = '';      // 已加载候选列表的番号（同一作品重复开关面板不重复请求）
+let _subReqSeq = 0;           // 序号防竞态
+let _subActiveUrl = '';       // 已挂载字幕的 CDN 地址（'' 为未挂载）
+let _subActiveItem = null;    // 已挂载字幕的条目（线路切换后重建 track 用）
+let _subBlobUrl = '';         // track 使用的 blob URL（换字幕/关闭时回收）
+let _subOffsetMs = 0;         // 字幕时间轴累计偏移（正数=延后；不同版本片源可能有整体错位）
+function subIsChinese(it) {
+  const base = (it.name || '').replace(/\.[a-z0-9]+$/i, '');
+  return /c$/i.test(base) || /中字|中文|简体|繁體|繁体|chs|chi/i.test((it.name || '') + ' ' + (it.langs || []).join(' '));
+}
+function subFmtDur(ms) {
+  const s = Math.round(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}` : `${m}:${String(x).padStart(2, '0')}`;
+}
+function subTag(cls, text) {
+  const s = document.createElement('span');
+  s.className = 'online-sub-tag ' + cls;
+  s.textContent = text;
+  return s;
+}
+function activeSubTrack() {
+  const video = document.getElementById('online-video');
+  const el = video && video.querySelector('track#online-sub-track');
+  return el ? el.track : null;
+}
+function shiftSubCues(ms) {
+  const tt = activeSubTrack();
+  if (!tt || !tt.cues || !ms) return;
+  const d = ms / 1000;
+  for (let i = 0; i < tt.cues.length; i++) {
+    tt.cues[i].startTime += d;
+    tt.cues[i].endTime += d;
+  }
+}
+function applySubOffset(deltaMs) {
+  _subOffsetMs += deltaMs;
+  shiftSubCues(deltaMs);
+  updateSubOffsetUI();
+}
+function updateSubOffsetUI() {
+  const el = document.getElementById('online-sub-offset');
+  if (el) el.textContent = (_subOffsetMs > 0 ? '+' : '') + (_subOffsetMs / 1000).toFixed(1) + 's';
+}
+function ensureSubShown() {
+  if (!_subActiveUrl || !_subBlobUrl) return;
+  const video = document.getElementById('online-video');
+  if (!video) return;
+  const el = video.querySelector('track#online-sub-track');
+  if (!el) { video.appendChild(buildSubtitleTrack(_subBlobUrl)); return; }
+  el.track.mode = 'showing';
+  // video.load()（切换线路）后 Chromium 会清空 cue 且不重拉相同 src 的 blob：重建 track 恢复
+  if (el.track.readyState !== 2 || !el.track.cues || el.track.cues.length === 0) {
+    el.remove();
+    video.appendChild(buildSubtitleTrack(_subBlobUrl));
+  }
+}
+function clearSubtitle(updateUI = true) {
+  const video = document.getElementById('online-video');
+  const el = video && video.querySelector('track#online-sub-track');
+  if (el) el.remove();
+  if (_subBlobUrl) { URL.revokeObjectURL(_subBlobUrl); _subBlobUrl = ''; }
+  _subActiveUrl = '';
+  _subActiveItem = null;
+  _subOffsetMs = 0;
+  if (updateUI) {
+    const btn = document.getElementById('online-sub-btn');
+    if (btn) btn.classList.remove('on');
+    const status = document.getElementById('online-sub-status');
+    if (status) status.textContent = '字幕已关闭';
+    updateSubOffsetUI();
+    renderSubList();
+  }
+}
+function resetSubtitleState() {
+  _subReqSeq++;
+  _subItems = [];
+  _subLoadedCode = '';
+  clearSubtitle(false);
+  const panel = document.getElementById('online-sub-panel');
+  if (panel) panel.hidden = true;
+  const btn = document.getElementById('online-sub-btn');
+  if (btn) btn.classList.remove('on');
+  const status = document.getElementById('online-sub-status');
+  if (status) status.textContent = '';
+  const list = document.getElementById('online-sub-list');
+  if (list) list.innerHTML = '';
+  updateSubOffsetUI();
+}
+async function searchSubtitles(code, force = false) {
+  const status = document.getElementById('online-sub-status');
+  const list = document.getElementById('online-sub-list');
+  const seq = ++_subReqSeq;
+  if (status) status.textContent = '正在搜索字幕（迅雷字幕库）…';
+  if (list) list.innerHTML = '';
+  try {
+    const resp = await relayFetch(`/__subtitles?code=${encodeURIComponent(code)}${force ? '&refresh=1' : ''}`, {}, 25000);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (seq !== _subReqSeq) return;   // 已切换作品/已关闭，丢弃过期结果
+    if (!data.ok) throw new Error(data.error || '搜索失败');
+    _subItems = data.items || [];
+    _subLoadedCode = code;
+    if (status) status.textContent = _subItems.length
+      ? `迅雷字幕库 · ${_subItems.length} 条（点击挂载，按与片源时长吻合度排序）`
+      : '该番号在迅雷字幕库暂无字幕（冷门作品可能无人上传）';
+    renderSubList();
+  } catch (e) {
+    if (seq !== _subReqSeq) return;
+    if (status) status.textContent = `字幕搜索失败：${e.message || e}，可点「↻ 刷新」重试`;
+  }
+}
+function renderSubList() {
+  const list = document.getElementById('online-sub-list');
+  if (!list) return;
+  list.innerHTML = '';
+  const video = document.getElementById('online-video');
+  const vdur = (video && isFinite(video.duration) && video.duration > 0) ? video.duration * 1000 : 0;
+  const items = _subItems.slice().sort((a, b) => {
+    const da = (a.duration && vdur) ? Math.abs(a.duration - vdur) : Infinity;   // 与片源时长最接近的排最前
+    const db = (b.duration && vdur) ? Math.abs(b.duration - vdur) : Infinity;
+    return da !== db ? da - db : (Number(subIsChinese(b)) - Number(subIsChinese(a)));   // 吻合度相同时中字优先
+  });
+  for (const it of items) {
+    const row = document.createElement('div');
+    row.className = 'online-sub-row' + (it.url === _subActiveUrl ? ' on' : '');
+    const name = document.createElement('span');
+    name.className = 'online-sub-name';
+    name.textContent = it.name || decodeURIComponent((it.url || '').split('/').pop() || '字幕');
+    name.title = it.extra ? `${name.textContent}（${it.extra}）` : name.textContent;
+    row.appendChild(name);
+    if (subIsChinese(it)) row.appendChild(subTag('cn', '中字'));
+    if (it.duration) row.appendChild(subTag('dur', subFmtDur(it.duration)));
+    if (vdur && it.duration && Math.abs(it.duration - vdur) < 5000) row.appendChild(subTag('match', '≈ 吻合'));
+    const dl = document.createElement('a');
+    dl.className = 'online-sub-dl';
+    dl.href = '#';
+    dl.textContent = '下载';
+    dl.title = '下载字幕文件（utf-8 编码，配合本地播放器使用）';
+    dl.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); downloadSubtitle(it); });
+    row.appendChild(dl);
+    row.addEventListener('click', () => applySubtitle(it));
+    list.appendChild(row);
+  }
+}
+async function applySubtitle(it) {
+  const status = document.getElementById('online-sub-status');
+  const seq = _subReqSeq;
+  if (status) status.textContent = '正在下载并转换字幕…';
+  try {
+    const resp = await relayFetch(`/__subtitle-file?u=${encodeURIComponent(it.url)}`, {}, 30000);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const vtt = await resp.text();
+    if (seq !== _subReqSeq) return;
+    if (!vtt.startsWith('WEBVTT')) throw new Error('字幕内容异常');
+    attachSubtitleTrack(URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' })), it);
+  } catch (e) {
+    if (seq !== _subReqSeq) return;
+    if (status) status.textContent = `字幕挂载失败：${e.message || e}`;
+  }
+}
+function buildSubtitleTrack(blobUrl) {
+  const tr = document.createElement('track');
+  tr.id = 'online-sub-track';
+  tr.kind = 'subtitles';
+  tr.srclang = 'zh';
+  tr.label = (_subActiveItem && _subActiveItem.name) || '字幕';
+  tr.default = true;             // video.load()（切换线路）后保持显示
+  tr.src = blobUrl;
+  // track 资源就绪（首次挂载或重建）时开启显示并补上累计时间轴偏移
+  tr.addEventListener('load', () => {
+    tr.track.mode = 'showing';
+    shiftSubCues(_subOffsetMs);
+  });
+  return tr;
+}
+function attachSubtitleTrack(blobUrl, it) {
+  const video = document.getElementById('online-video');
+  if (!video) return;
+  clearSubtitle(false);          // 移除旧 track 并回收旧 blob（同时清零偏移）
+  _subBlobUrl = blobUrl;
+  _subActiveUrl = it.url;
+  _subActiveItem = it;
+  video.appendChild(buildSubtitleTrack(blobUrl));
+  const btn = document.getElementById('online-sub-btn');
+  if (btn) btn.classList.add('on');
+  const status = document.getElementById('online-sub-status');
+  if (status) status.textContent = `已挂载：${it.name || '字幕'}${it.duration ? `（时长 ${subFmtDur(it.duration)}）` : ''}`;
+  const panel = document.getElementById('online-sub-panel');
+  if (panel) panel.hidden = true;   // 挂载成功后收起面板；需微调/换字幕时再点「字幕」展开
+  renderSubList();
+}
+async function downloadSubtitle(it) {
+  const status = document.getElementById('online-sub-status');
+  try {
+    const resp = await relayFetch(`/__subtitle-file?u=${encodeURIComponent(it.url)}&raw=1`, {}, 30000);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    const a = document.createElement('a');
+    // 带 BOM 的 utf-8：Windows 本地播放器（PotPlayer 等）显示中文不乱码
+    a.href = URL.createObjectURL(new Blob(['\ufeff' + text], { type: 'text/plain;charset=utf-8' }));
+    let name = (it.name || 'subtitle.srt').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'subtitle.srt';
+    if (!/\.(srt|vtt)$/i.test(name)) name += '.srt';
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+  } catch (e) {
+    if (status) status.textContent = `字幕下载失败：${e.message || e}`;
+  }
+}
+function toggleSubPanel() {
+  const panel = document.getElementById('online-sub-panel');
+  if (!panel) return;
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden && _onlineCode && _subLoadedCode !== _onlineCode) searchSubtitles(_onlineCode);
+}
 function bindOnlinePlayButton(w) {
   const btn = document.getElementById('d-online-btn');
   if (btn) btn.addEventListener('click', () => {

@@ -11,6 +11,9 @@
   内存缓存 30 分钟
 - GET /__online-m3u8?u=javday播放列表地址：播放列表代理，逐片子域重写为主域（分段 CORS 全开，
   浏览器直连拉流不经服务器中转）
+- GET /__subtitles?code=番号[&refresh=1]：迅雷字幕库搜索（网友上传，srt 为主），内存缓存 30 分钟
+- GET /__subtitle-file?u=字幕直链[&raw=1]：抓取字幕文件（域名白名单限制），编码统一 utf-8，
+  默认转 WebVTT 文本供 <track> 渲染；raw=1 返回原始字幕文本供下载
 启动：python scripts/avdanyu-server.py （start-viewer.bat 启动本脚本）
 """
 import html
@@ -1094,6 +1097,191 @@ def proxy_online_m3u8(url):
     return _ONLINE_SUB_HOST_RE.sub('https://javday.homes/', text), ''
 
 
+# ==================== 迅雷字幕搜索与转换（在线播放浮层「字幕」） ====================
+# 字幕来自迅雷播放器公开字幕接口（网友上传，srt 为主，少量 vtt/ass）：
+#   GET https://api-shoulei-ssl.xunlei.com/oracle/subtitle?gcid=&cid=&name=番号
+#   -> {"code":0,"data":[{url 字幕直链, ext, name, duration 毫秒(全片时长), languages, extra_name}]}
+# 文件存放于迅雷系 CDN（实测无防盗链）。/__subtitles 只返回搜索列表；
+# /__subtitle-file 抓取文件后统一编码转 WebVTT 文本，前端经 relayFetch 取文本后
+# 用 blob URL 挂到 <video><track>（track 元素无法携带鉴权头，故不经其直接请求本端点）。
+SUBTITLE_CACHE_TTL = 1800            # 搜索结果缓存 30 分钟（与磁力/评论一致）
+_subtitle_cache = {}                 # code -> (写入时间戳, result)
+_subtitle_cache_lock = threading.Lock()
+_subfile_cache = {}                  # 字幕 url -> (写入时间戳, (text, is_vtt))
+_subfile_cache_lock = threading.Lock()
+_SUBFILE_CACHE_MAX = 64              # 单条字幕几十 KB，64 条上限足够且内存可控
+
+_SUB_API = 'https://api-shoulei-ssl.xunlei.com/oracle/subtitle'
+# 字幕文件地址白名单：迅雷系字幕 CDN + 字幕扩展名，防止本端点被当作 SSRF 跳板
+_SUB_FILE_RE = re.compile(
+    r'^https://[a-z0-9.-]*\.(?:geilijiasu\.com|xunlei\.com|sandai\.net|sandai\.cn)/'
+    r'[a-z0-9./_-]+\.(?:srt|vtt)$', re.I)
+_SRT_TS_RE = re.compile(r'(\d{1,2}:\d{2}:\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2})[,.](\d{1,3})')
+
+
+def _ext_http_get_bytes(url, timeout=20, extra_headers=None):
+    """外站 GET 返回原始字节（字幕文件编码不定，不能按 utf-8 先解码）。直连优先，失败走本机代理。
+    与 _http_once 同策略：curl_cffi（浏览器指纹）优先，证书异常降级不校验，urllib 兜底。"""
+    headers = {'User-Agent': _UA, 'Accept-Language': 'en-US,en;q=0.8,zh-CN;q=0.6'}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    def _once(proxy):
+        curl_err = ''
+        try:
+            from curl_cffi import requests as creq
+            proxies = {'http': proxy, 'https': proxy} if proxy else None
+            try:
+                r = creq.get(url, impersonate='chrome', timeout=timeout, headers=headers, proxies=proxies)
+                if r.status_code == 200 and r.content:
+                    return r.content, ''
+                curl_err = f'HTTP {r.status_code}'
+            except Exception as e:
+                curl_err = str(e)
+                # 中文用户名目录等环境 certifi CA 路径异常时降级为不校验证书（公开字幕 CDN，可接受）
+                if 'trust anchor' in curl_err or '(77)' in curl_err:
+                    try:
+                        r = creq.get(url, impersonate='chrome', timeout=timeout, headers=headers,
+                                     proxies=proxies, verify=False)
+                        if r.status_code == 200 and r.content:
+                            return r.content, ''
+                        curl_err = f'HTTP {r.status_code}'
+                    except Exception as e2:
+                        curl_err = f'{curl_err} / {e2}'
+        except ImportError:
+            pass
+        try:
+            if proxy:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({'http': proxy, 'https': proxy}))
+                req = urllib.request.Request(url, headers=headers)
+                with opener.open(req, timeout=timeout) as resp:
+                    return resp.read(), ''
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read(), ''
+        except Exception as e:
+            return None, curl_err or str(e)
+
+    raw, err = _once('')
+    if raw is not None:
+        return raw, ''
+    proxy = _pick_local_proxy()
+    if not proxy:
+        return None, err
+    raw, err2 = _once(proxy)
+    if raw is not None:
+        return raw, ''
+    return None, f'{err} | via {proxy}: {err2}'
+
+
+def fetch_xunlei_subtitles(code, refresh=False):
+    """按番号搜索迅雷字幕库，返回去重后的候选列表。"""
+    code = (code or '').strip().upper()
+    if not _ONLINE_CODE_RE.fullmatch(code.lower()):
+        return {'ok': False, 'error': '缺少或非法的番号参数'}
+    now = time.time()
+    if not refresh:
+        hit = _subtitle_cache.get(code)
+        if hit and now - hit[0] < SUBTITLE_CACHE_TTL:
+            return {'ok': True, 'cached': True, **hit[1]}
+    api = _SUB_API + '?' + urllib.parse.urlencode({'gcid': '', 'cid': '', 'name': code})
+    text, err = _ext_http_get(api, extra_headers={'Accept': 'application/json, text/plain, */*'})
+    if text is None:
+        return {'ok': False, 'error': f'请求字幕接口失败: {err[:120]}'}
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return {'ok': False, 'error': '字幕接口返回的不是 JSON'}
+    data = payload.get('data') if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        data = data.get('list')
+    items, seen = [], set()
+    if isinstance(data, list):
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            url = str(it.get('url') or it.get('link') or it.get('download_url') or '').strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            try:
+                dur = int(it.get('duration') or 0)
+            except (TypeError, ValueError):
+                dur = 0
+            items.append({
+                'name': str(it.get('name') or it.get('filename') or it.get('title') or '').strip()[:150],
+                'url': url,
+                'ext': str(it.get('ext') or '').strip().lstrip('.').lower(),
+                'duration': dur,          # 全片时长（毫秒），供前端与片源时长比对挑选
+                'langs': [str(x).strip() for x in (it.get('languages') or []) if str(x).strip()][:4],
+                'extra': str(it.get('extra_name') or '').strip()[:60],
+            })
+    result = {'code': code, 'items': items}
+    with _subtitle_cache_lock:
+        _subtitle_cache[code] = (time.time(), result)
+    return {'ok': True, 'cached': False, **result}
+
+
+def _decode_subtitle_bytes(raw):
+    """字幕内容统一解码：去 BOM 后依次尝试 utf-8 / gbk / big5，全失败按 utf-8 容错。"""
+    if raw[:3] == b'\xef\xbb\xbf':
+        raw = raw[3:]
+        try:
+            return raw.decode('utf-8')
+        except Exception:
+            pass
+    for enc in ('utf-8', 'gbk', 'big5'):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode('utf-8', 'replace')
+
+
+def _srt_ts_dots(m):
+    """SRT 时间戳逗号改点号，毫秒补齐 3 位（WebVTT 格式）。"""
+    return f'{m.group(1)}.{int(m.group(2)):03d} --> {m.group(3)}.{int(m.group(4)):03d}'
+
+
+def srt_to_vtt(text):
+    """SRT 文本转 WebVTT：加文件头、时间戳改点毫秒、裸 < 转义（在 VTT 里是标签起始符）。
+    已是 WebVTT 的内容原样返回（仅统一换行符）。"""
+    text = text.replace('\r\n', '\n').replace('\r', '\n').strip('\ufeff').strip()
+    if text.startswith('WEBVTT'):
+        return text
+    out = []
+    for line in text.split('\n'):
+        line = _SRT_TS_RE.sub(_srt_ts_dots, line)
+        out.append(line.replace('<', '&lt;'))
+    return 'WEBVTT\n\n' + '\n'.join(out).strip()
+
+
+def fetch_subtitle_file(url):
+    """抓取并转换一条字幕。返回 ((vtt文本, 原始文本)|None, error)，带内存缓存。"""
+    url = (url or '').strip()
+    if not _SUB_FILE_RE.match(url):
+        return None, '仅允许迅雷字幕 CDN 的 srt/vtt 地址'
+    with _subfile_cache_lock:
+        hit = _subfile_cache.get(url)
+        if hit and time.time() - hit[0] < SUBTITLE_CACHE_TTL:
+            return hit[1], ''
+    raw, err = _ext_http_get_bytes(url)
+    if raw is None:
+        return None, f'字幕文件下载失败: {err[:120]}'
+    if not raw.strip():
+        return None, '字幕文件内容为空'
+    text = _decode_subtitle_bytes(raw)
+    result = (srt_to_vtt(text), text)
+    with _subfile_cache_lock:
+        if len(_subfile_cache) >= _SUBFILE_CACHE_MAX:   # 简单过期清理，避免长期增长
+            cutoff = time.time() - SUBTITLE_CACHE_TTL
+            for k in [k for k, v in _subfile_cache.items() if v[0] < cutoff]:
+                del _subfile_cache[k]
+        _subfile_cache[url] = (time.time(), result)
+    return result, ''
+
+
 TR_FILE = BASE / 'avdanyu-data' / 'translations.json'
 _tr_lock = threading.Lock()
 
@@ -1227,6 +1415,37 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
                 pass
+            return
+        if self.path.split('?', 1)[0] == '/__subtitles':
+            # 与 /__magnets 同理：触发对外请求，需同源令牌防跨站滥用
+            if not self._token_ok():
+                return self._send_json(403, json.dumps({'ok': False, 'error': 'forbidden: missing or invalid token'}))
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            code = (qs.get('code') or [''])[0]
+            refresh = (qs.get('refresh') or [''])[0] in ('1', 'true')
+            out = json.dumps(fetch_xunlei_subtitles(code, refresh), ensure_ascii=False)
+            return self._send_json(200, out)
+        if self.path.split('?', 1)[0] == '/__subtitle-file':
+            # 前端经 relayFetch 携带令牌取 VTT 文本，再用 blob URL 挂 <track>（track 元素带不了鉴权头）
+            if not self._token_ok():
+                return self._send_json(403, json.dumps({'ok': False, 'error': 'forbidden: missing or invalid token'}))
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            u = (qs.get('u') or [''])[0]
+            raw_mode = (qs.get('raw') or [''])[0] in ('1', 'true')
+            pair, err = fetch_subtitle_file(u)
+            if pair is None:
+                return self._send_json(400, json.dumps({'ok': False, 'error': err}, ensure_ascii=False))
+            data = (pair[1] if raw_mode else pair[0]).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', ('text/plain' if raw_mode else 'text/vtt') + '; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                pass
+            return
         if self.path == '/__translations':
             data = load_translations_file()
             raw = json.dumps(data, ensure_ascii=False).encode('utf-8')

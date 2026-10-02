@@ -8,7 +8,7 @@
 
 | 文件 | 用途 | 什么时候需要 |
 | --- | --- | --- |
-| `avdanyu-server.py` | 提供本地网页、数据库和译文同步接口，中继标题翻译请求，中继外站磁力搜索（`/__magnets`）与 JavDB 評論區抓取（`/__comments`），解析 FANZA 预告片直链（`/__trailer`） | 每次通过 `start-viewer.bat` 启动时 |
+| `avdanyu-server.py` | 提供本地网页、数据库和译文同步接口，中继标题翻译请求，中继外站磁力搜索（`/__magnets`）与 JavDB 評論區抓取（`/__comments`），解析 FANZA 预告片直链（`/__trailer`），搜索迅雷字幕库（`/__subtitles`）并中继下载转 WebVTT（`/__subtitle-file`，域名白名单限迅雷系 CDN） | 每次通过 `start-viewer.bat` 启动时 |
 | `test_javdb_comments.py` | JavDB 評論區解析器单元测试（离线，喂合成/真实片段 HTML，含根目录 `javdb_geo_block.html` 地区封锁页 fixture）；`python scripts/test_javdb_comments.py` | 修改评论解析逻辑后 |
 | `sql-wasm.js`、`sql-wasm.wasm` | 浏览器读取 `avdanyu.db` 所需的 SQLite 引擎，两个文件须配套保留 | 打开数据库时 |
 | `avdanyu-exporter.user.js` | 浏览器油猴脚本，从来源网站导出月度作品文件；不由查看器自动执行 | 抓取或更新作品数据时 |
