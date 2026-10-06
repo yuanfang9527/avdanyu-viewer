@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""用智谱 GLM 重新翻译译文中英文词汇偏多的条目（谷歌引擎时代遗留）。
+"""用智谱 GLM 重新翻译译文中质量不佳的条目（谷歌引擎时代遗留）。
 
-筛选规则：译文含 ≥2 个英文/罗马音词（如 "Fuua Kaede"、"NO.1 STYLE AV DEBUT"），
-或完全没有汉字的译文。重译失败/被内容过滤的条目保留原值，下次运行自动重试。
+默认模式：重译含 ≥2 个英文/罗马音词、或完全没有汉字的译文。
+--names 模式：重译人名不规范的译文（含假名人名如 白花にあ，或结尾挂罗马音人名如 Fuua Kaede），
+配合服务端「日本人名转换为通行简体汉字」的提示词规则。
 
 用法（项目根目录运行）：
-  python scripts/retranslate-en.py --dry-run     # 只统计数量和样例，不修改
-  python scripts/retranslate-en.py               # 全量重译
-  python scripts/retranslate-en.py --limit 50    # 小批量试跑
-  python scripts/retranslate-en.py --reset       # 清空进度记录后重新开始
+  python scripts/retranslate-en.py --dry-run            # 只统计数量和样例，不修改
+  python scripts/retranslate-en.py                      # 默认模式全量重译
+  python scripts/retranslate-en.py --names --dry-run    # 人名模式统计
+  python scripts/retranslate-en.py --names              # 人名模式全量重译
+  python scripts/retranslate-en.py --names --limit 50   # 小批量试跑
+  python scripts/retranslate-en.py --names --reset      # 清空人名模式进度重新开始
 
 说明：
 - 复用 avdanyu-server.py 的智谱翻译链路（端点探测、内容过滤自动拆批）。
 - 每完成 5 批即把结果原子写回 translations.json，随时可 Ctrl+C 中断，重跑自动续。
-- 进度记录在 avdanyu-data/retranslate-progress.json（GLM 译文也可能合法保留
-  "NO.1 STYLE" 等英文词，仅靠筛选条件无法识别"已修好"，故用进度文件防止重复重译）。
-- 浏览器端下次打开页面时自动以磁盘译文为准更新本地缓存（需查看器 v3 同步逻辑）。
+- 重译失败/被内容过滤的条目保留原值；默认模式记入 retranslate-progress.json，
+  人名模式记入 retranslate-names-progress.json（防止重复重译）。
+- 浏览器端下次打开页面时自动以磁盘译文为准更新本地缓存。
 """
 import argparse
 import importlib.util
@@ -30,6 +33,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 TR_FILE = BASE / 'avdanyu-data' / 'translations.json'
 PROGRESS_FILE = BASE / 'avdanyu-data' / 'retranslate-progress.json'
+PROGRESS_NAMES_FILE = BASE / 'avdanyu-data' / 'retranslate-names-progress.json'
 BATCH = 15
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -55,6 +59,17 @@ def needs_retry(zh):
     return len(lw) >= 2 or (cjk_count(zh) == 0 and len(lw) >= 1)
 
 
+def needs_name_fix(zh):
+    """人名问题条目：含连续假名（如 白花にあ），或结尾挂罗马音人名（如 Fuua Kaede）。"""
+    if not zh:
+        return False
+    if re.search(r'[\u3040-\u309f\u30a0-\u30ff]{2,}', zh):
+        return True
+    if re.search(r'[A-Z][a-z]+ [A-Z][a-z]+$', zh.strip()):
+        return True
+    return False
+
+
 def load_json(path, default):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -71,25 +86,30 @@ def save_json_atomic(path, data):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='用智谱 GLM 重译英文词汇偏多的译文')
+    ap = argparse.ArgumentParser(description='用智谱 GLM 重译英文词汇偏多或人名不规范的译文')
     ap.add_argument('--dry-run', action='store_true', help='只统计，不翻译不修改')
     ap.add_argument('--limit', type=int, default=0, help='最多处理多少条（0=不限）')
     ap.add_argument('--workers', type=int, default=2, help='并发数（默认 2）')
     ap.add_argument('--reset', action='store_true', help='清空进度记录重新开始')
+    ap.add_argument('--names', action='store_true',
+                    help='人名修复模式：重译含假名人名或结尾罗马音人名的条目（独立进度）')
     args = ap.parse_args()
 
-    if args.reset and PROGRESS_FILE.exists():
-        PROGRESS_FILE.unlink()
+    needs = needs_name_fix if args.names else needs_retry
+    progress_file = PROGRESS_NAMES_FILE if args.names else PROGRESS_FILE
+
+    if args.reset and progress_file.exists():
+        progress_file.unlink()
         print('已清空进度记录。')
 
     data = load_json(TR_FILE, {})
     if not data:
         print('未找到译文文件或内容为空。')
         return
-    done = set(load_json(PROGRESS_FILE, []))
+    done = set(load_json(progress_file, []))
 
-    targets = [k for k, v in data.items() if needs_retry(v) and k not in done]
-    total_all = sum(1 for v in data.values() if needs_retry(v))
+    targets = [k for k, v in data.items() if needs(v) and k not in done]
+    total_all = sum(1 for v in data.values() if needs(v))
     print(f'译文总数 {len(data)}，命中筛选 {total_all} 条，待处理 {len(targets)} 条'
           f'（已完成 {total_all - len(targets)}）。')
 
@@ -113,7 +133,7 @@ def main():
         current = load_json(TR_FILE, {})
         current.update(updates)
         save_json_atomic(TR_FILE, current)
-        save_json_atomic(PROGRESS_FILE, sorted(done))
+        save_json_atomic(progress_file, sorted(done))
 
     def worker():
         while True:

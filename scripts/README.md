@@ -6,18 +6,22 @@
 
 作品详情中的 JavDB 評論區由 `GET /__comments` 接口抓取：番号搜索定位视频页 → 评论片段端点（`/v/{id}/reviews/lastest`，视频页解析兜底）→ 解析作者/评分/日期/正文，内存缓存 30 分钟。JavDB 屏蔽日本/韩国出口而预告片（FANZA）又需要日本出口，两者按目标站点分出口：JavDB 请求独立挑选出口（`AVDANYU_JAVDB_PROXY` 显式指定 > 直连与本机常见代理端口逐个试探，地区封锁/CF 验证页视为出口不可用，可用出口记忆 10 分钟），磁力/预告片/在线播放仍走原有全局代理逻辑；域名可用环境变量 `AVDANYU_JAVDB_HOSTS` 覆盖。
 
+演员详情抽屉的个人信息由 `GET /__actor-info` 接口抓取聚合（参考 JvedioNext / MetaTube 方案），字段按整源优先级：みんなのAV（minnano-av.com，事务所/厂商官方口径；搜索端点被 Cloudflare 拦截，改用后台全量五十音索引定位演员页——`avdanyu-data/minnano-index.json` 约 2-3 万人「名字→ID」映射，7 天自动重建，首次构建约 25-30 分钟且增量可查）> sexy-profile 汇总库 > JavBus（爱好/男优资料）；JavDB 补充别名与 Twitter/Instagram（独立容错），头像优先取 gfriends 头像库（`raw.githubusercontent.com/gfriends/gfriends`，约 3.4 万演员，索引 Filetree.json 约 6.5MB 启动后后台预热、2 小时刷新）；内存缓存 6 小时。头像经 `GET /__actor-pic` 中转（域名白名单限 JavBus/JavDB/gfriends/DMM 图片域，按域带 Referer 过防盗链），前端以 blob 挂 `<img>`。
+
 | 文件 | 用途 | 什么时候需要 |
 | --- | --- | --- |
-| `avdanyu-server.py` | 提供本地网页、数据库和译文同步接口，中继标题翻译请求，中继外站磁力搜索（`/__magnets`）与 JavDB 評論區抓取（`/__comments`），解析 FANZA 预告片直链（`/__trailer`），搜索迅雷字幕库（`/__subtitles`）并中继下载转 WebVTT（`/__subtitle-file`，域名白名单限迅雷系 CDN） | 每次通过 `start-viewer.bat` 启动时 |
+| `avdanyu-server.py` | 提供本地网页、数据库和译文同步接口，中继标题翻译请求，中继外站磁力搜索（`/__magnets`）与 JavDB 評論區抓取（`/__comments`），解析 FANZA 预告片直链（`/__trailer`），搜索迅雷字幕库（`/__subtitles`）并中继下载转 WebVTT（`/__subtitle-file`，域名白名单限迅雷系 CDN），抓取演员个人信息（`/__actor-info`，みんなのAV+sexy-profile+JavBus+JavDB+gfriends 聚合）并中转头像素材（`/__actor-pic`） | 每次通过 `start-viewer.bat` 启动时 |
+| `minnano-index.json`（`avdanyu-data/`） | みんなのAV 演员名索引（自动生成，「名字→演员ID」映射），7 天自动重建 | 服务器自动维护，勿手动编辑 |
 | `test_javdb_comments.py` | JavDB 評論區解析器单元测试（离线，喂合成/真实片段 HTML，含根目录 `javdb_geo_block.html` 地区封锁页 fixture）；`python scripts/test_javdb_comments.py` | 修改评论解析逻辑后 |
 | `sql-wasm.js`、`sql-wasm.wasm` | 浏览器读取 `avdanyu.db` 所需的 SQLite 引擎，两个文件须配套保留 | 打开数据库时 |
 | `avdanyu-exporter.user.js` | 浏览器油猴脚本，从来源网站导出月度作品文件；不由查看器自动执行 | 抓取或更新作品数据时 |
 | `avdanyu-merge.py` | 把月度 `.txt` 文件整合进 `avdanyu-data/avdanyu.db`，并保留已有封面 | 导入新月度数据时 |
 | `dedupe_works.py` | 按同月、同番号、同标题合并重复作品；`avdanyu-merge.py` 也会导入其中的去重函数 | 合并数据时必须保留；也可手动运行全库去重 |
 | `backfill-covers.py` | 验证外部图床返回有效图片后，为数据库中的空封面回填地址 | 继续补封面时，可选 |
-| `retranslate-en.py` | 用智谱 GLM 重译译文中英文词汇偏多的条目（谷歌引擎时代遗留，人名被翻成罗马音等）；筛选、批量重译、增量写回，支持中断续跑 | 觉得旧译文英文太多时，可选 |
+| `retranslate-en.py` | 用智谱 GLM 重译质量不佳的译文：默认模式针对英文词汇偏多的条目，`--names` 模式针对人名不规范条目（假名人名/结尾罗马音人名）；筛选、批量重译、增量写回，支持中断续跑 | 觉得旧译文英文太多或人名是假名/罗马音时，可选 |
 | `cover-backfill-state.json` | 回填脚本生成的最近一次批次及累计成功数；任务本身以数据库中仍为空的封面为准 | 仅用于查看回填统计，可重新生成 |
-| `retranslate-progress.json` | 重译脚本记录的已处理条目（GLM 译文也可能合法含 "NO.1 STYLE" 等英文词，仅靠筛选无法识别"已修好"，故用此文件防止重复重译） | 任务全部完成后可删除以重新全量筛选 |
+| `retranslate-progress.json` | 重译脚本（默认模式）记录的已处理条目（GLM 译文也可能合法含 "NO.1 STYLE" 等英文词，仅靠筛选无法识别"已修好"，故用此文件防止重复重译） | 任务全部完成后可删除以重新全量筛选 |
+| `retranslate-names-progress.json` | 重译脚本（`--names` 人名模式）记录的已处理条目 | 同上 |
 | `cover-missing.txt` | 回填脚本生成的未解决作品清单和失败原因 | 排查剩余空封面时，可重新生成 |
 | `avdanyu-server.log` | 本地服务生成的诊断日志 | 排查服务问题时，可重新生成 |
 

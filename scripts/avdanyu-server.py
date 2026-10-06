@@ -6,11 +6,17 @@
   失败时降级 curl_cffi / Google 免费端点，最后兜底 MyMemory
 - GET /__magnets?q=番号[&refresh=1]：按番号搜索外站磁力（sukebei 主源，btdig 备源），内存缓存 30 分钟
 - GET /__comments?q=番号[&refresh=1]：JavDB 評論區抓取（搜索定位视频页 → 解析评论），内存缓存 30 分钟
+- GET /__actor-info?name=演员名[&ptype=f|m][&refresh=1]：演员个人信息抓取，字段按整源优先级聚合：
+  みんなのAV（事务所/厂商口径，后台五十音索引定位，avdanyu-data/minnano-index.json 7 天重建）
+  > sexy-profile 汇总库 > JavBus 补充行；JavDB 补别名/Twitter/Instagram；内存缓存 6 小时；
+  头像优先 gfriends 头像库（github.com/gfriends/gfriends，JvedioNext/MetaTube 同款源）
+- GET /__actor-pic?u=头像地址：演员头像中转（仅白名单 JavBus/JavDB/gfriends 图片域名），供前端 blob 挂 <img>
 - GET /__trailer?cid=番号[&refresh=1]：解析 FANZA 试看片直链（多画质，带签名 token），内存缓存 1 小时
 - GET /__online-player?code=番号：解析 javday 播放源（搜索番号 → 视频页 → m3u8 直链，多线路），
-  内存缓存 30 分钟
-- GET /__online-m3u8?u=javday播放列表地址：播放列表代理，逐片子域重写为主域（分段 CORS 全开，
-  浏览器直连拉流不经服务器中转）
+  内存缓存 30 分钟；无片源时自动回落备用源（123av，全量代理模式）
+- GET /__online-m3u8?u=播放列表地址：播放列表代理。javday 域名白名单 + 逐片子域重写为主域
+  （分段浏览器直连）；备用源为白名单登记地址，子列表/分段重写为本地代理
+- GET /__online-ts?u=分段地址：备用源 TS 分段中转（按登记的 Referer 抓取后原样转发）
 - GET /__subtitles?code=番号[&refresh=1]：迅雷字幕库搜索（网友上传，srt 为主），内存缓存 30 分钟
 - GET /__subtitle-file?u=字幕直链[&raw=1]：抓取字幕文件（域名白名单限制），编码统一 utf-8，
   默认转 WebVTT 文本供 <track> 渲染；raw=1 返回原始字幕文本供下载
@@ -194,8 +200,10 @@ def zhipu_translate_texts(texts, source_lang, target_lang):
     dst = _LANG_NAMES.get(target_lang, target_lang)
 
     def build_prompt(chunk):
-        return (f'你是标题翻译引擎。将下列 JSON 数组中的每条{src}文本翻译成{dst}，'
-                f'番号（如 ABP-769）、英文人名、品牌等保留原文不译。'
+        return (f'你是标题翻译引擎。将下列 JSON 数组中的每条{src}文本翻译成{dst}；'
+                f'番号（如 ABP-769）、英文人名、品牌等保留原文不译；'
+                f'日本人名一律转换为通行的简体中文写法（如 三上悠亜→三上悠亚；'
+                f'假名人名按通行译名转写为汉字，无通行译名时按发音音译为汉字，不要保留假名或罗马字）。'
                 f'仅输出一个 JSON 对象 {{"t": ["译文1", "译文2", ...]}}，'
                 f'数组长度必须等于输入的 {len(chunk)} 条，禁止输出任何其他内容。\n'
                 + json.dumps(chunk, ensure_ascii=False))
@@ -976,6 +984,643 @@ def fetch_javdb_comments(q, refresh=False):
     return {'ok': True, 'cached': False, **result}
 
 
+# ==================== 演员个人信息抓取（演员详情抽屉「个人信息」数据源） ====================
+# 字段按整源优先级聚合：みんなのAV（事务所/厂商官方口径，本地索引定位）> sexy-profile 汇总库
+# > JavBus（爱好等补充行、男优资料）；JavDB 提供别名、Twitter/Instagram、影片数；
+# 头像优先 gfriends 头像库（JvedioNext/MetaTube 同款源）。各源独立容错，失败不影响其他源。
+# みんなのAV 的搜索端点被 Cloudflare 人机验证拦截，改用后台全量五十音索引定位演员页（详见下文）。
+ACTOR_CACHE_TTL = 21600             # 演员资料极少变化，内存缓存 6 小时；「重新抓取」带 refresh=1 绕过
+_actor_cache = {}                   # 'f:名字' / 'm:名字' -> (写入时间戳, result)
+_actor_cache_lock = threading.Lock()
+
+# 头像代理白名单：JavBus 图片路径、JavDB 头像 CDN（c0~c9.jdbstatic.com）、gfriends 头像库、
+# DMM 演员图（JavBus 男优头像的实际来源域）
+_ACTOR_PIC_URL_RE = re.compile(
+    r'^https://(?:www\.javbus\.com/pics/(?:actress|male)/|c\d\.jdbstatic\.com/avatars/'
+    r'|raw\.githubusercontent\.com/gfriends/gfriends/master/Content/'
+    r'|pics\.dmm\.co\.jp/mono/actjpgs/)[A-Za-z0-9._/%()~?=&-]+$', re.I)
+
+# ---- gfriends 头像库（JvedioNext/MetaTube 同款头像源） ----
+# https://github.com/gfriends/gfriends ：社区维护的演员头像库（数万演员，按名字精确匹配，
+# 同名多图按来源目录组织）。Filetree.json 为全量索引（约 6.5MB），懒加载进内存建倒排，
+# 失败静默（无头像不影响字段数据），10 分钟内不重试、成功后 2 小时刷新一次。
+_GFRIENDS_TREE_URL = 'https://raw.githubusercontent.com/gfriends/gfriends/master/Filetree.json'
+_GFRIENDS_CONTENT_URL = 'https://raw.githubusercontent.com/gfriends/gfriends/master/Content/'
+_GFRIENDS_TTL = 7200
+_GFRIENDS_RETRY = 600
+_gfriends_state = {'at': 0, 'try_at': 0, 'index': {}}   # index: 演员名 -> [(目录, 文件路径)]
+_gfriends_lock = threading.Lock()
+
+
+def _gfriends_index():
+    now = time.time()
+    with _gfriends_lock:
+        if _gfriends_state['index'] and now - _gfriends_state['at'] < _GFRIENDS_TTL:
+            return _gfriends_state['index']
+        if now - _gfriends_state['try_at'] < _GFRIENDS_RETRY:
+            return _gfriends_state['index']   # 最近尝试过（失败或刚成功），不重复拉
+        _gfriends_state['try_at'] = now
+    text, err = _ext_http_get(_GFRIENDS_TREE_URL, timeout=45)
+    index = {}
+    if text is None:
+        log('gfriends 头像索引拉取失败: ' + (err or '')[:120])
+    else:
+        try:
+            content = json.loads(text).get('Content') or {}
+            for d, files in content.items():
+                if not isinstance(files, dict):
+                    continue
+                for n, p in files.items():
+                    stem = n.rsplit('.', 1)[0]
+                    index.setdefault(stem, []).append((d, str(p)))
+            # 目录按字母序（z- 官方修图来源排后），倒序让修图版优先（与 MetaTube 一致）
+            for stem in index:
+                index[stem].reverse()
+            log(f'gfriends 头像索引就绪: {len(index)} 位演员')
+        except Exception as e:
+            log('gfriends 头像索引解析失败: ' + str(e)[:120])
+    if index:
+        with _gfriends_lock:
+            _gfriends_state['index'] = index
+            _gfriends_state['at'] = now
+    return _gfriends_state['index']
+
+
+def _gfriends_lookup(name):
+    """演员名（或其别名）-> 头像直链列表（已 URL 编码，浏览器/中转可直接访问）。"""
+    hits = _gfriends_index().get((name or '').strip()) or []
+    urls = []
+    for d, p in hits:
+        path, sep, query = p.partition('?')
+        u = (_GFRIENDS_CONTENT_URL + urllib.parse.quote(d, safe='') + '/' +
+             urllib.parse.quote(path, safe=''))
+        if sep:
+            u += sep + query
+        if u not in urls:
+            urls.append(u)
+    return urls
+
+
+def _gfriends_prewarm():
+    threading.Thread(target=_gfriends_index, daemon=True).start()
+
+# JavBus 演员搜索结果与页面里出现的类别词（label 形如「深田えいみ 有碼」）
+_ACTOR_TAG_WORDS = ('有碼', '無碼', '歐美', '欧美', 'FC2')
+
+
+def _strip_actor_tags(label):
+    out = label or ''
+    for w in _ACTOR_TAG_WORDS:
+        out = out.replace(w, ' ')
+    return re.sub(r'\s+', ' ', out).strip()
+
+
+# ---- sexy-profile 汇总库（女优字段优先源；仅收录女优，男优不查） ----
+# WordPress 站：/?s=名字 搜索，结果卡片文本以「名字 年齢 N歳 (Y/M/D) 身長 …」开头；
+# 详情页资料在 wp-block-table 表格里（年齢(誕生日)/出身地/身長/スリーサイズ/デビュー年…），
+# 三围一行合并为 88/64/91 (Fカップ)。字段名统一转中文输出，与 JavBus 字段行同构。
+def _sexy_profile_find(search_page, name):
+    """搜索结果页 -> (slug|None)。只认卡片可见文本以查询名开头的第一条，避免误配。"""
+    for m in re.finditer(r'<a[^>]+href="https?://sexy-profile\.com/([^"?#/]+)/?"[^>]*>(.*?)</a>',
+                         search_page, re.S):
+        slug = m.group(1)
+        if any(x in slug for x in ('cupsize', 'birthdayyear', 'birthplace', 'tag', 'category', 'page', 'feed')):
+            continue
+        label = _javdb_clean_text(m.group(2))
+        if label.startswith(name):
+            return slug
+    return None
+
+
+def _parse_sexy_profile_page(page):
+    """详情页 -> 中文字段行列表。生日行拆出年龄；三围行拆出罩杯；身长归一成 Ncm。"""
+    fields = []
+    for row in re.findall(r'<tr[^>]*>(.*?)</tr>', page, re.S):
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S)
+        if len(tds) < 2:
+            continue
+        key, val = _javdb_clean_text(tds[0]), _javdb_clean_text(tds[1])
+        if not key or not val:
+            continue
+        if re.match(r'年齢\s*[（(]?\s*誕生日', key):
+            dm = re.search(r'(\d{4}/\d{1,2}/\d{1,2})', val)
+            am = re.search(r'(\d+)\s*歳', val)
+            if dm:
+                fields.append(['生日', dm.group(1)])
+            if am:
+                fields.append(['年齡', am.group(1) + '歳'])
+        elif key == '出身地':
+            fields.append(['出生地', val[:20]])
+        elif key == '身長':
+            hm = re.search(r'(\d{2,3}(?:\.\d)?)\s*cm', val, re.I)
+            fields.append(['身高', (hm.group(1) + 'cm') if hm else val[:12]])
+        elif 'スリーサイズ' in key:
+            sm = re.search(r'(\d{2,3})\s*/\s*(\d{2,3})\s*/\s*(\d{2,3})', val)
+            cm = re.search(r'([A-Z])\s*カップ', val)
+            if sm:
+                fields.append(['三圍', f'B{sm.group(1)} / W{sm.group(2)} / H{sm.group(3)}'])
+            if cm:
+                fields.append(['罩杯', cm.group(1)])
+        elif key == 'デビュー年':
+            fields.append(['出道', val[:10]])
+    return fields
+
+
+def fetch_sexy_profile(name):
+    """sexy-profile 查询 -> ({'fields': [...], 'url': ...} 或 {}, err)。
+    未收录返回空 dict 且 err 为空（常态，不告警）；网络失败 err 非空（计入 warn）。"""
+    text, err = _ext_http_get('https://sexy-profile.com/?s=' + urllib.parse.quote(name),
+                              extra_headers={'Accept-Language': 'ja,en;q=0.7'})
+    if text is None:
+        return {}, ('sexy-profile: ' + (err or '不可达'))[:120]
+    slug = _sexy_profile_find(text, name)
+    if not slug:
+        return {}, ''
+    page, err2 = _ext_http_get('https://sexy-profile.com/' + slug + '/',
+                               extra_headers={'Accept-Language': 'ja,en;q=0.7',
+                                              'Referer': 'https://sexy-profile.com/'})
+    fields = _parse_sexy_profile_page(page) if page else []
+    if not fields:
+        # 页面拿到了却解析不出字段：多半是页面结构变化，如实上报便于排查
+        return {}, ('sexy-profile: 演员页无字段（' + slug + '）' if page
+                    else 'sexy-profile: ' + (err2 or '演员页不可达'))[:120]
+    return {'fields': fields, 'url': 'https://sexy-profile.com/' + slug + '/'}, ''
+
+
+# ---- みんなのAV（minnano-av.com，女优资料库） ----
+# 站点资料最全（生年月日/サイズ T/B/W/H/罩杯/出身地/所属事務所/出演期間/趣味），且官方说明
+# 身高罩杯等数字「ツイッター&メーカーのものをそのまま採用」（事务所/厂商口径）。
+# 搜索端点 search_result.php 被 Cloudflare 人机验证拦截（服务器端无法过 JS challenge，
+# 直连/代理/浏览器指纹/会话 cookie 均已尝试），但列表页与演员页可直接访问——
+# 方案：后台全量爬五十音索引（actress_list.php?gojuon=行&page=N，每页 40 人，共约
+# 500-800 页）建「名字 -> 演员ID」映射，落盘 avdanyu-data/minnano-index.json（7 天重建），
+# 爬行中增量并入内存（边爬边可用）；演员资料页 actress{id}.html 按需抓取解析。
+MINNANO_INDEX_FILE = BASE / 'avdanyu-data' / 'minnano-index.json'
+MINNANO_INDEX_TTL = 7 * 86400
+MINNANO_PAGE_DELAY = 0.25          # 列表页抓取间隔（秒），礼貌限速（响应本身约 2s，全量约 25-30 分钟）
+MINNANO_ROW_PAGE_CAP = 120         # 单行最多翻页数（保险，正常行 < 30 页）
+_minnano_lock = threading.Lock()
+_minnano_state = {'index': {}, 'building': False, 'built_at': 0}
+
+# 五十音行参数兜底表（正常从列表页解析，站方调整时兜底）
+_MINNANO_ROWS_FALLBACK = ['a', 'i', 'u', 'e', 'o', 'ka', 'ki', 'ku', 'ke', 'ko', 'sa', 'shi', 'su',
+                          'se', 'so', 'ta', 'chi', 'tsu', 'te', 'to', 'na', 'ni', 'nu', 'ne', 'no',
+                          'ha', 'hi', 'hu', 'he', 'ho', 'ma', 'mi', 'mu', 'me', 'mo', 'ya', 'yu',
+                          'yo', 'ra', 'ri', 'ru', 're', 'ro', 'wa', 'wo', 'n']
+
+
+def _minnano_get(path, referer=None):
+    headers = {'User-Agent': _UA, 'Accept-Language': 'ja,en;q=0.7'}
+    if referer:
+        headers['Referer'] = referer
+    return _ext_http_get('https://www.minnano-av.com' + path, timeout=20, extra_headers=headers)
+
+
+def _minnano_rows():
+    text, _ = _minnano_get('/actress_list.php')
+    if text:
+        rows = sorted(set(re.findall(r'gojuon=([a-z]+)', text)), key=lambda r: (_MINNANO_ROWS_FALLBACK.index(r)
+                  if r in _MINNANO_ROWS_FALLBACK else 99, r))
+        if len(rows) >= 40:
+            return rows
+    return _MINNANO_ROWS_FALLBACK
+
+
+def _minnano_parse_cards(page_text):
+    """列表页 -> {演员名: id}。同一卡片有图片/文字多个同 id 链接，名字取首次出现的最短形式。"""
+    out = {}
+    for m in re.finditer(r'<a href="actress(\d+)\.html"[^>]*>(.*?)</a>', page_text, re.S):
+        aid, label = m.group(1), _javdb_clean_text(m.group(2))
+        label = label.replace('女優情報', '').strip()
+        if not label:
+            continue
+        name = label.split(' ', 1)[0].strip()
+        if name and name not in out:
+            out[name] = aid
+    return out
+
+
+def _minnano_dump_index(index, final=False):
+    """索引落盘（原子替换）。爬行中每完成一行调用一次，进程被杀/休眠悬挂也不丢已爬进度。"""
+    try:
+        MINNANO_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MINNANO_INDEX_FILE.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'builtAt': _minnano_state.get('built_at') or (time.time() if final else 0),
+                       'index': index}, f, ensure_ascii=False, separators=(',', ':'))
+        tmp.replace(MINNANO_INDEX_FILE)
+        return True
+    except Exception as e:
+        log('minnano 索引写盘失败: ' + str(e)[:120])
+        return False
+
+
+def _minnano_build_index_sync():
+    with _minnano_lock:
+        if _minnano_state['building']:
+            return
+        _minnano_state['building'] = True
+    try:
+        index = dict(_minnano_state.get('index') or {})
+        start_n, pages = len(index), 0
+
+        def crawl_row(row):
+            """爬单行。返回 True 完成 / False 失败（网络问题，需重试）。"""
+            nonlocal pages
+            fails = 0
+            for page in range(1, MINNANO_ROW_PAGE_CAP + 1):
+                text, err = _minnano_get(f'/actress_list.php?gojuon={row}&page={page}')
+                if text is None:
+                    if '404' in (err or ''):
+                        return True                # 翻过头：该行结束
+                    fails += 1
+                    if fails >= 5:
+                        log(f'minnano 索引 {row} 行连续失败，稍后重试: ' + (err or '')[:80])
+                        return False
+                    time.sleep(3)
+                    continue
+                fails = 0
+                cards = _minnano_parse_cards(text)
+                if not cards:
+                    return True                    # 空页：该行结束
+                index.update(cards)
+                pages += 1
+                with _minnano_lock:                # 增量并入：爬行中即可查询
+                    _minnano_state['index'] = dict(index)
+                if pages % 60 == 0:
+                    log(f'minnano 索引爬行中: {pages} 页 / {len(index)} 人')
+                if len(cards) < 10:
+                    return True                    # 尾页（不足一整页）
+                time.sleep(MINNANO_PAGE_DELAY)
+            return True
+
+        # 首轮爬全部行；网络波动失败的行进入重试队列，最多再补 3 轮
+        # （休眠唤醒/代理切换的短暂故障若直接跳行，い/う 等常见行会整行缺失）
+        pending, rounds = _minnano_rows(), 0
+        while pending and rounds < 4:
+            failed = []
+            for row in pending:
+                if not crawl_row(row):
+                    failed.append(row)
+                # 每行结束即落盘：进程中断（休眠悬挂/被杀）不丢整行进度
+                with _minnano_lock:
+                    _minnano_state['index'] = dict(index)
+                _minnano_dump_index(index)
+            pending, rounds = failed, rounds + 1
+            if pending:
+                log(f'minnano 索引第 {rounds} 轮后待重试行: {", ".join(pending)}')
+                time.sleep(30)
+        if pending:
+            log(f'minnano 索引重试后仍失败的行（7 天后重建时再补）: {", ".join(pending)}')
+        with _minnano_lock:
+            _minnano_state['index'] = dict(index)
+            _minnano_state['built_at'] = time.time()
+        _minnano_dump_index(index, final=True)
+        log(f'minnano 索引构建完成: {pages} 页, {start_n} -> {len(index)} 人')
+    finally:
+        with _minnano_lock:
+            _minnano_state['building'] = False
+
+
+def _minnano_init():
+    """启动时加载索引文件；缺失或超过 7 天后台重建（旧索引先用着，重建增量覆盖）。"""
+    data, built_at = {}, 0
+    try:
+        raw = json.loads(MINNANO_INDEX_FILE.read_text(encoding='utf-8'))
+        if isinstance(raw, dict):
+            built_at = float(raw.get('builtAt') or 0)
+            data = {str(k): str(v) for k, v in (raw.get('index') or {}).items() if k and v}
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log('minnano 索引读取失败: ' + str(e)[:120])
+    with _minnano_lock:
+        if data:
+            _minnano_state['index'] = data
+            _minnano_state['built_at'] = built_at
+    if data and time.time() - built_at < MINNANO_INDEX_TTL:
+        log(f'minnano 索引就绪: {len(data)} 位演员')
+        return
+    threading.Thread(target=_minnano_build_index_sync, daemon=True).start()
+
+
+def _minnano_lookup(name):
+    with _minnano_lock:
+        return _minnano_state['index'].get((name or '').strip()) or ''
+
+
+def _parse_minnano_actor_page(page):
+    """演员页 act-profile 表 -> 中文字段行。行结构 <span>键</span><p>值</p>；
+    サイズ行形如 T158 / B88(Iカップ) / W59 / H91。"""
+    fields = []
+    m = re.search(r'<div class="act-profile">.*?<table[^>]*>(.*?)</table>', page, re.S)
+    block = m.group(1) if m else ''
+    for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', block, re.S):
+        km = re.search(r'<span>([^<]+)</span>', tr)
+        if not km:
+            continue
+        key = km.group(1).strip()
+        val = _javdb_clean_text(tr.split('</span>', 1)[1] if '</span>' in tr else '')
+        if not key or not val:
+            continue
+        if key == '生年月日':
+            dm = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', val)
+            am = re.search(r'(\d+)\s*歳', val)
+            if dm:
+                fields.append(['生日', f'{dm.group(1)}/{int(dm.group(2))}/{int(dm.group(3))}'])
+            if am:
+                fields.append(['年齡', am.group(1) + '歳'])
+        elif key == 'サイズ':
+            tm = re.search(r'\bT(\d{2,3})\b', val)
+            bm = re.search(r'\bB(\d{2,3})\b', val)
+            wm = re.search(r'\bW(\d{2,3})\b', val)
+            hm = re.search(r'\bH(\d{2,3})\b', val)
+            cm = re.search(r'([A-Z])\s*カップ', val)
+            if tm:
+                fields.append(['身高', tm.group(1) + 'cm'])
+            if bm and wm and hm:
+                fields.append(['三圍', f'B{bm.group(1)} / W{wm.group(1)} / H{hm.group(1)}'])
+            if cm:
+                fields.append(['罩杯', cm.group(1)])
+        elif key == '出身地':
+            fields.append(['出生地', val[:20]])
+        elif key == '所属事務所':
+            fields.append(['事務所', val[:30]])
+        elif key == 'AV出演期間':
+            fields.append(['出道', val[:16]])
+        elif key in ('趣味・特技', '趣味', '特技'):
+            fields.append(['愛好', val[:60]])
+    return fields
+
+
+def fetch_minnano_profile(name):
+    """みんなのAV 查询 -> ({'fields': [...], 'url': ...} 或 {}, err)。
+    索引未命中（未收录/索引未建好）返回空且不告警；演员页失败 err 非空。"""
+    aid = _minnano_lookup(name)
+    if not aid:
+        return {}, ''
+    text, err = _minnano_get(f'/actress{aid}.html')
+    if text is None:
+        return {}, ('minnano: ' + (err or '演员页不可达'))[:120]
+    if 'Just a moment' in text[:600]:
+        return {}, 'minnano: 演员页被人机验证拦截'
+    fields = _parse_minnano_actor_page(text)
+    if not fields:
+        return {}, ''                        # 页面存在但无资料行：视为无数据，不告警
+    return {'fields': fields, 'url': f'https://www.minnano-av.com/actress{aid}.html'}, ''
+
+
+def _javbus_get(path, referer=None):
+    """JavBus GET：直连优先，失败按 JavDB 同款出口候选轮试（复用 curl_cffi 指纹请求）。
+    JavBus 无地区封锁，不读写 JavDB 的好/坏出口记忆，互不影响。返回 (text|None, err)。"""
+    headers = dict(_JAVDB_DOC_HEADERS)
+    headers['Referer'] = (referer or 'https://www.javbus.com/')
+    errs = []
+    for exit_proxy in _javdb_exit_candidates():
+        text, kind, err = _javdb_fetch_once('https://www.javbus.com' + path, headers, exit_proxy)
+        if kind == 'ok':
+            return text, ''
+        errs.append(err)
+    # 任一出口明确 404 即为「搜索词无结果」：网络层故障不会产生 404，无须全体出口一致
+    if errs and any('404' in e for e in errs):
+        return None, 'javbus: HTTP 404 无结果'
+    return None, 'javbus: 直连与所有已尝试代理出口均不可达'
+
+
+def _javbus_find_star(page, name):
+    """演员搜索结果页 -> (star_path|None, 展示名)。label 形如「深田えいみ 有碼」；
+    去类别词后须与查询名完全一致才认（JavBus 为精确搜索，宽松匹配容易拿错人）；
+    多条一致时优先「有碼」（无码版条目常缺资料）。"""
+    want = (name or '').strip()
+    best = None
+    for href, inner in re.findall(r'<a[^>]+href="(?:https?://[^"]*?)?(/star/[A-Za-z0-9]+)"[^>]*>(.*?)</a>',
+                                  page, re.S):
+        label = _javdb_clean_text(inner)
+        star_name = _strip_actor_tags(label)
+        if star_name != want:
+            continue
+        if best is None or ('有碼' in label):
+            best = (href, star_name)
+    return best or ('', '')
+
+
+def _parse_javbus_star_page(page):
+    """JavBus 演员页 -> dict。资料区结构：
+    <div class="avatar-box"><div class="photo-frame"><img src="/pics/actress/xx_a.jpg">…
+    <div class="photo-info"><span class="pb10">名字</span><p>身高: 173cm</p>…</div></div>
+    影片总数取自头部「全部影片 N 部」。字段行按页面顺序原样返回，前端负责呈现。"""
+    out = {'fields': [], 'photo': '', 'works': None}
+    box = re.search(r'<div class="avatar-box">(.*?)</div>\s*</div>', page, re.S)
+    if not box:
+        return out
+    block = box.group(1)
+    im = re.search(r'<img[^>]+src="([^"]+)"', block)
+    if im:
+        src = html.unescape(im.group(1))
+        if 'nowprinting' in src:
+            src = ''                     # DMM 无图占位（男优常见），不算头像
+        elif src.startswith('/'):
+            src = 'https://www.javbus.com' + src
+        out['photo'] = src
+    for p in re.findall(r'<p>(.*?)</p>', block, re.S):
+        line = _javdb_clean_text(p)
+        if not line or ':' not in line and '：' not in line:
+            continue
+        key, _, val = line.replace('：', ':', 1).partition(':')
+        key, val = key.strip(), val.strip()
+        if key and val:
+            out['fields'].append([key[:12], val[:80]])
+    # 影片总数取自头部「全部影片 N 部」；先去 script 再匹配——页面内嵌广告脚本的
+    # adzone 数字紧跟在「全部影片」文本之后，不去掉会把广告位编号当成影片数
+    clean = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', page, flags=re.S | re.I)
+    wm = re.search(r'全部影片[^0-9]{0,20}(\d[\d,]*)', html.unescape(clean))
+    if wm:
+        out['works'] = int(wm.group(1).replace(',', ''))
+    return out
+
+
+def _javdb_find_actors(page, name):
+    """JavDB 演员搜索页 -> [(href, label), ...]，最多 3 个候选。排除顶部「有碼/無碼/歐美」
+    入口链接；label 带类别词（如「無碼 深田えいみ」）的是无码版条目，降权保留——
+    有的演员只有无码版页面，丢了会找不到。"""
+    out, seen = [], set()
+    for href, inner in re.findall(r'<a[^>]+href="(/actors/[A-Za-z0-9]+)"[^>]*>(.*?)</a>', page, re.S):
+        label = _javdb_clean_text(inner)
+        if not label or href in seen:
+            continue
+        seen.add(href)
+        if href in ('/actors/censored', '/actors/uncensored', '/actors/western'):
+            continue
+        out.append((href, label))
+    out.sort(key=lambda x: 0 if not any(w in x[1] for w in _ACTOR_TAG_WORDS) else 1)
+    return out[:3]
+
+
+def _parse_javdb_actor_page(page):
+    """JavDB 演员页 -> dict。名字区结构：
+    <span class="actor-section-name">主名, 别名1</span><span class="section-meta">别名2</span>
+    <span class="section-meta">860 部影片</span>；
+    Twitter/Instagram 是 section-addition 里的外链按钮；头像是 span.avatar 的内联背景图。"""
+    out = {'names': [], 'works': None, 'photo': '', 'twitter': '', 'instagram': ''}
+    nm = re.search(r'<span class="actor-section-name">(.*?)</span>(.*?)</h2>', page, re.S)
+    if nm:
+        for n in re.split(r'[,，、]', nm.group(1)):   # 半角/全角逗号与顿号均可能作分隔
+            n = _javdb_clean_text(n)
+            if n:
+                out['names'].append(n)
+        for extra in re.findall(r'<span class="section-meta">(.*?)</span>', nm.group(2), re.S):
+            t = _javdb_clean_text(extra)
+            wm = re.match(r'(\d+)\s*部影片', t)
+            if wm:
+                out['works'] = int(wm.group(1))
+                continue
+            # 别名串（section-meta 里也可能是逗号连接的多个别名，如「向山裕, 巧克力球向井」）
+            for n in re.split(r'[,，、]', t):
+                n = n.strip()
+                if n and n not in out['names']:
+                    out['names'].append(n)
+    av = re.search(r'class="avatar"[^>]*style="[^"]*background-image:\s*url\(([^)]+)\)', page)
+    if av:
+        out['photo'] = html.unescape(av.group(1).strip('\'"'))
+    links = re.findall(r'<a[^>]+href="(https?://(?:twitter|x)\.com/[A-Za-z0-9_]+|https?://instagram\.com/[A-Za-z0-9_.]+)"',
+                       page)
+    for u in links:
+        if 'instagram' in u:
+            out['instagram'] = out['instagram'] or u
+        else:
+            out['twitter'] = out['twitter'] or u
+    return out
+
+
+def fetch_actor_info(name, ptype='f', refresh=False):
+    name = (name or '').strip()
+    ptype = 'm' if ptype == 'm' else 'f'
+    if not name or len(name) > 64:
+        return {'ok': False, 'error': '缺少或非法的演员名参数'}
+    cache_key = ptype + ':' + name
+    if not refresh:
+        hit = _actor_cache.get(cache_key)
+        if hit and time.time() - hit[0] < ACTOR_CACHE_TTL:
+            return {'ok': True, 'cached': True, **hit[1]}
+
+    err_parts = []
+
+    # ---- みんなのAV 字段最优先（数字采用事务所/厂商官方口径；仅女优） ----
+    mn, mn_err = ({}, '')
+    if ptype == 'f':
+        mn, mn_err = fetch_minnano_profile(name)
+        if mn_err:
+            err_parts.append(mn_err)
+
+    # ---- sexy-profile 字段次优先（minnano 未收录时；仅女优） ----
+    sp, sp_err = ({}, '')
+    if ptype == 'f' and not mn:
+        sp, sp_err = fetch_sexy_profile(name)
+        if sp_err:
+            err_parts.append(sp_err)
+
+    # ---- JavBus 补充字段与头像 ----
+    javbus = {}
+    page, err = _javbus_get('/searchstar/' + urllib.parse.quote(name))
+    if page is None:
+        # 搜索无结果时 JavBus 返回 404：视为「未收录」而非网络故障，不记入 warn
+        if '404' not in (err or ''):
+            err_parts.append(err[:120])
+    else:
+        star_path, star_name = _javbus_find_star(page, name)
+        if star_path:
+            spage, err2 = _javbus_get(star_path, referer='https://www.javbus.com' + star_path)
+            if spage is None:
+                err_parts.append(err2[:120])
+            else:
+                javbus = _parse_javbus_star_page(spage)
+                javbus['url'] = 'https://www.javbus.com' + star_path
+                javbus['name'] = star_name
+
+    # ---- JavDB 补充（独立容错） ----
+    javdb = {}
+    host, spage, err3 = _javdb_get('/search?q=' + urllib.parse.quote(name) + '&f=actor')
+    if spage is None:
+        err_parts.append(('javdb: ' + (err3 or ''))[:120])
+    else:
+        # 候选页名字区须包含查询名（JavDB 主名常为另一写法，如 深田えいみ -> 深田詠美, 深田えいみ）
+        for href, label in _javdb_find_actors(spage, name):
+            h2, apage, err4 = _javdb_get(href)
+            if apage is None:
+                err_parts.append(('javdb: ' + (err4 or ''))[:120])
+                continue
+            parsed = _parse_javdb_actor_page(apage)
+            joined = ' '.join(parsed['names'])
+            if name in joined or name == label:
+                javdb = parsed
+                javdb['url'] = 'https://' + (h2 or 'javdb.com') + href
+                break
+
+    if not javbus and not javdb and not sp and not mn:
+        # 各站均无数据仍可给 gfriends 头像（有些演员只有头像没有资料）
+        gf = _gfriends_lookup(name)
+        result = {'name': name, 'ptype': ptype, 'fields': [], 'notFound': True, 'sources': {},
+                  'photos': gf[:6], 'photo': gf[0] if gf else ''}
+    else:
+        # 字段整源优先：minnano（事务所/厂商口径）> sexy-profile（汇总库）> JavBus（爱好等它独有的行）；
+        # 已有三围合并行时，后续源的 胸圍/腰圍/臀圍 三条分行不再补充（各源数字常有出入，避免并列误导）
+        primary = mn.get('fields') or sp.get('fields') or []
+        primary_keys = {k for k, _ in primary}
+        if '三圍' in primary_keys:
+            primary_keys |= {'胸圍', '腰圍', '臀圍'}
+        fields = primary + [f for f in (javbus.get('fields') or []) if f[0] not in primary_keys]
+        result = {
+            'name': name,
+            'ptype': ptype,
+            'works': javbus.get('works') if javbus.get('works') is not None else javdb.get('works'),
+            'fields': fields,
+            'aliases': [n for n in javdb.get('names', []) if n and n != name][:6],
+            'twitter': javdb.get('twitter', ''),
+            'instagram': javdb.get('instagram', ''),
+            'sources': {k: v for k, v in (('minnano', mn.get('url')),
+                                          ('sexy-profile', sp.get('url')),
+                                          ('javbus', javbus.get('url')),
+                                          ('javdb', javdb.get('url'))) if v},
+        }
+        # 头像优先级：gfriends 头像库（质量高、覆盖广，JvedioNext/MetaTube 同款）> JavBus > JavDB；
+        # 别名（JavDB 主名常为另一写法）也查一遍 gfriends
+        photos = _gfriends_lookup(name)[:3]
+        for alias in result['aliases']:
+            photos += [u for u in _gfriends_lookup(alias)[:2] if u not in photos]
+        for u in (javbus.get('photo'), javdb.get('photo')):
+            if u and u not in photos:
+                photos.append(u)
+        result['photos'] = photos[:6]
+        result['photo'] = photos[0] if photos else ''
+    if err_parts:
+        result['warn'] = '；'.join(err_parts)[:300]
+    # 各站均无数据：网络故障（任一源有错误）时结果不可信，不写缓存让下次打开重试；
+    # 各站都正常响应但确无收录才是真 notFound，照常缓存
+    if not (result.get('notFound') and err_parts):
+        with _actor_cache_lock:
+            _actor_cache[cache_key] = (time.time(), result)
+    return {'ok': True, 'cached': False, **result}
+
+
+def fetch_actor_pic(u):
+    """演员头像中转：白名单（JavBus /pics/ 与 JavDB avatars CDN）内地址经本地服务器抓取，
+    前端用 blob URL 挂 <img>（img 标签带不了鉴权头）。JavBus 图片有防盗链，须带 Referer。"""
+    u = (u or '').strip()
+    if not _ACTOR_PIC_URL_RE.match(u):
+        return None, '头像地址不在白名单内'
+    # JavBus 图片有防盗链须带 Referer；gfriends（GitHub raw）无需；DMM/JavDB 图片按各自站点带
+    if 'javbus.com' in u:
+        headers = {'Referer': 'https://www.javbus.com/'}
+    elif 'dmm.co.jp' in u:
+        headers = {'Referer': 'https://www.dmm.co.jp/'}
+    elif 'githubusercontent.com' in u:
+        headers = {}
+    else:
+        headers = {'Referer': 'https://javdb.com/'}
+    headers['Accept'] = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+    return _ext_http_get_bytes(u, timeout=12, extra_headers=headers)
+
+
 # ==================== FANZA 预告片解析（详情抽屉「预告片」本地播放） ====================
 # 流程：cid -> FANZA html5_player 页面（需年龄验证 Cookie）-> 解析内嵌 JSON 的 bitrates 数组
 #       -> 得到带签名 token 的 cc3001.dmm.co.jp/pv/ 直链（可直接热链播放，无需 Referer）。
@@ -1032,8 +1677,53 @@ _online_cache_lock = threading.Lock()
 _ONLINE_CODE_RE = re.compile(r'[a-z0-9]{2,12}-[a-z0-9]{2,8}')
 _ONLINE_M3U8_HOST_RE = re.compile(r'^https://[a-z0-9.-]*javday\.homes/[a-z0-9./_-]+\.m3u8$', re.I)
 _ONLINE_SUB_HOST_RE = re.compile(r'https://[a-z0-9-]+\.javday\.homes/', re.I)
-# 中文字幕标记：搜索卡片/视频页标题里出现即视为中字版本，多结果时优先选择
-_ONLINE_CN_RE = re.compile(r'中文字幕|中字|简体|繁体|简中|繁中')
+# 备用源（123av）播放页用 Alpine.js 把每集播放器地址（如 https://jproshop.site/e/XXXX）
+# 内嵌在 x-data 的 JSON.parse('...') 里，字符串是 JS 转义格式（\" 为 \u0022、/ 为 \/）
+_JS_SIMPLE_ESC = {'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f', 'v': '\v',
+                  '0': '\0', '\\': '\\', "'": "'", '"': '"', '/': '/', '`': '`'}
+# 备用源代理白名单：url -> (写入时间戳, referer)。解析器登记其产出的流地址，
+# 列表代理把发现的子列表/分段也登记进来；/__online-ts 与备用源列表代理只接受已登记地址（防 SSRF）。
+_online_proxy_registry = {}
+_online_proxy_registry_lock = threading.Lock()
+_ONLINE_PROXY_TTL = 7200
+
+
+def _js_unescape(s):
+    out, i, n = [], 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch != '\\' or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        d = s[i + 1]
+        if d == 'u' and i + 6 <= n:
+            try:
+                out.append(chr(int(s[i + 2:i + 6], 16)))
+                i += 6
+                continue
+            except ValueError:
+                pass
+        out.append(_JS_SIMPLE_ESC.get(d, d))
+        i += 2
+    return ''.join(out)
+
+
+def _register_online_url(url, referer):
+    if not url.startswith('https://'):
+        return
+    now = time.time()
+    with _online_proxy_registry_lock:
+        if len(_online_proxy_registry) > 4096:   # 懒清理过期项，防无界增长
+            for k in [k for k, v in _online_proxy_registry.items() if now - v[0] > _ONLINE_PROXY_TTL]:
+                del _online_proxy_registry[k]
+        _online_proxy_registry[url] = (now, referer)
+
+
+def _lookup_online_referer(url):
+    with _online_proxy_registry_lock:
+        hit = _online_proxy_registry.get(url)
+    return hit[1] if hit and time.time() - hit[0] < _ONLINE_PROXY_TTL else None
 
 
 def fetch_online_player(code, refresh=False):
@@ -1045,12 +1735,23 @@ def fetch_online_player(code, refresh=False):
         hit = _online_cache.get(code)
         if hit and now - hit[0] < ONLINE_CACHE_TTL:
             return {'ok': True, 'cached': True, **hit[1]}
+    result = _resolve_online_javday(code)
+    if result is None:
+        result = _resolve_online_fallback(code)   # 主源无片源/不可达：回落备用源
+    if result is None:
+        return {'ok': False, 'error': '主源与备用源均无可用片源，可点右下角「搜索番号」手动查找'}
+    with _online_cache_lock:
+        _online_cache[code] = (time.time(), result)
+    return {'ok': True, 'cached': False, **result}
+
+
+def _resolve_online_javday(code):
+    """主源解析：搜索页 → 视频页 → m3u8 直链（主域分段 CORS 全开，浏览器直连）。失败返回 None。"""
     hdrs = {'Referer': 'https://javday.app/'}
-    search, err = _ext_http_get(f'https://javday.app/search/wd/{urllib.parse.quote(code)}/',
-                                extra_headers=hdrs)
+    search, _ = _ext_http_get(f'https://javday.app/search/wd/{urllib.parse.quote(code)}/',
+                              extra_headers=hdrs)
     if search is None:
-        return {'ok': False, 'error': f'请求 javday 失败: {err[:120]}'}
-    # 解析搜索卡片：(链接, 标题)；同番号常有无字/中字两个版本，标题带中字标记的优先
+        return None
     entries, seen = [], set()
     for href, body in re.findall(r'<a href="(/videos/[a-zA-Z0-9_-]+/)"[^>]*class="videoBox">([\s\S]*?)</a>', search):
         if href in seen:
@@ -1059,42 +1760,127 @@ def fetch_online_player(code, refresh=False):
         tm = re.search(r'<span class="title">([^<]*)</span>', body)
         entries.append((href, html.unescape(tm.group(1)).strip() if tm else ''))
     if not entries:
-        return {'ok': False, 'error': '该番号在 javday 无搜索结果，可点右下角「搜索番号」确认'}
-    cn_entries = [e for e in entries if _ONLINE_CN_RE.search(e[1])]
-    link, vtitle = (cn_entries or entries)[0]
-    page, err = _ext_http_get('https://javday.app' + link, extra_headers=hdrs)
+        return None
+    link = entries[0][0]
+    page, _ = _ext_http_get('https://javday.app' + link, extra_headers=hdrs)
     if page is None:
-        return {'ok': False, 'error': f'请求 javday 视频页失败: {err[:120]}'}
+        return None
     m3u8s = list(dict.fromkeys(re.findall(r'https://[a-z0-9.-]*javday\.homes/[^\s"\'\\<>]+?\.m3u8', page)))
     if not m3u8s:
-        return {'ok': False, 'error': '该视频页没有可用播放源（可能需要登录或已下架）'}
+        return None
     poster_m = re.search(r'(https://img\.javday\.app/upload/[^"\'\s\\)]+)', page)
     pt = re.search(r'<title>([^<]*)</title>', page)
     page_title = html.unescape(pt.group(1)).strip() if pt else ''
-    result = {
+    return {
         'code': code,
+        'via': 'javday',
         'pageUrl': 'https://javday.app' + link,
+        'searchUrl': f'https://javday.app/search/wd/{urllib.parse.quote(code)}/',
         'poster': poster_m.group(1) if poster_m else '',
-        'title': vtitle or page_title,
-        'cnSub': bool(cn_entries) or bool(_ONLINE_CN_RE.search(page_title)),
+        'title': (entries[0][1] or page_title),
         'sources': [{'name': f'线路{i + 1}', 'url': u} for i, u in enumerate(m3u8s)],
     }
-    with _online_cache_lock:
-        _online_cache[code] = (time.time(), result)
-    return {'ok': True, 'cached': False, **result}
+
+
+def _resolve_online_fallback(code):
+    """备用源解析（123av）：播放页 episodes JSON → 播放器 /stream → m3u8（CDN 锁 Referer，
+    需经本地 /__online-m3u8 + /__online-ts 全量代理，解析时把流地址登记进代理白名单）。"""
+    page, _ = _ext_http_get(f'https://123av.com/en/v/{urllib.parse.quote(code)}',
+                            extra_headers={'Referer': 'https://123av.com/'})
+    if page is None:
+        return None
+    m = re.search(r"JSON\.parse\('(\[.*?\])'\)", page, re.S)
+    episodes = []
+    if m:
+        try:
+            data = json.loads(_js_unescape(m.group(1)))
+        except Exception:
+            data = []
+        for it in data if isinstance(data, list) else []:
+            src = str(it.get('url') or '')
+            if src.startswith('//'):
+                src = 'https:' + src
+            if src.startswith('https://'):
+                episodes.append(src)
+    if not episodes:
+        return None
+    sources = []
+    for i, ep in enumerate(episodes):
+        host = re.match(r'(https://[^/]+)', ep).group(1)
+        hid_m = re.search(r'/e/([a-zA-Z0-9_]+)', ep)
+        if not host or not hid_m:
+            continue
+        stream, _ = _ext_http_get(f'{host}/stream?id={hid_m.group(1)}',
+                                  extra_headers={'Referer': host + '/', 'Origin': host})
+        if not stream:
+            continue
+        try:
+            m3u8 = json.loads(stream).get('media', {}).get('stream') or ''
+        except Exception:
+            continue
+        if not m3u8.startswith('https://'):
+            continue
+        _register_online_url(m3u8, host + '/')
+        sources.append({'name': f'线路{i + 1}' if len(episodes) == 1 else f'第{i + 1}段', 'url': m3u8})
+    if not sources:
+        return None
+    return {
+        'code': code,
+        'via': 'fallback',
+        'pageUrl': f'https://123av.com/en/v/{urllib.parse.quote(code)}',
+        'searchUrl': f'https://123av.com/en/search?keyword={urllib.parse.quote(code)}',
+        'poster': '',
+        'title': '',
+        'proxied': True,   # 前端提示用：此源分段经本地服务器中转
+        'sources': sources,
+    }
 
 
 def proxy_online_m3u8(url):
-    """javday 播放列表代理：校验域名后抓取，把逐片子域重写为主域（主域分段 CORS 全开）。"""
+    """播放列表代理。javday：域名白名单校验后抓取，逐片子域重写为主域（分段浏览器直连）。
+    备用源（白名单登记地址）：CDN 锁 Referer，抓取后把子列表/分段全部重写为本地代理地址。"""
     url = (url or '').strip()
-    if not _ONLINE_M3U8_HOST_RE.match(url):
-        return None, '仅允许 javday.homes 的 m3u8 地址'
-    text, err = _ext_http_get(url, extra_headers={'Referer': 'https://javday.app/'})
+    if _ONLINE_M3U8_HOST_RE.match(url):
+        text, err = _ext_http_get(url, extra_headers={'Referer': 'https://javday.app/'})
+        if text is None:
+            return None, f'抓取播放列表失败: {err[:120]}'
+        if '#EXTM3U' not in text[:64]:
+            return None, '返回内容不是有效的 m3u8 播放列表'
+        return _ONLINE_SUB_HOST_RE.sub('https://javday.homes/', text), ''
+    referer = _lookup_online_referer(url)
+    if referer is None:
+        return None, '该播放列表地址未在代理白名单中'
+    text, err = _ext_http_get(url, extra_headers={'Referer': referer})
     if text is None:
         return None, f'抓取播放列表失败: {err[:120]}'
     if '#EXTM3U' not in text[:64]:
         return None, '返回内容不是有效的 m3u8 播放列表'
-    return _ONLINE_SUB_HOST_RE.sub('https://javday.homes/', text), ''
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s and not s.startswith('#'):
+            absu = urllib.parse.urljoin(url, s)
+            _register_online_url(absu, referer)
+            q = urllib.parse.quote(absu, safe='')
+            if absu.lower().split('?')[0].endswith('.m3u8'):
+                s = f'/__online-m3u8?u={q}'
+            else:
+                s = f'/__online-ts?u={q}'
+            out.append(s)
+        else:
+            out.append(line)
+    return '\n'.join(out) + '\n', ''
+
+
+def proxy_online_segment(url):
+    """备用源分段代理：按白名单登记的 Referer 抓取 TS 分段，原样转发给浏览器。"""
+    referer = _lookup_online_referer(url)
+    if referer is None:
+        return None, '该分段地址未在代理白名单中'
+    raw, err = _ext_http_get_bytes(url, timeout=30, extra_headers={'Referer': referer})
+    if raw is None:
+        return None, f'抓取分段失败: {err[:120]}'
+    return raw, ''
 
 
 # ==================== 迅雷字幕搜索与转换（在线播放浮层「字幕」） ====================
@@ -1379,6 +2165,39 @@ class Handler(SimpleHTTPRequestHandler):
             refresh = (qs.get('refresh') or [''])[0] in ('1', 'true')
             out = json.dumps(fetch_javdb_comments(q, refresh), ensure_ascii=False)
             return self._send_json(200, out)
+        if self.path.split('?', 1)[0] == '/__actor-info':
+            # 与 /__magnets 同理：触发对外请求，需同源令牌防跨站滥用
+            if not self._token_ok():
+                return self._send_json(403, json.dumps({'ok': False, 'error': 'forbidden: missing or invalid token'}))
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            name = (qs.get('name') or [''])[0]
+            ptype = (qs.get('ptype') or ['f'])[0]
+            refresh = (qs.get('refresh') or [''])[0] in ('1', 'true')
+            out = json.dumps(fetch_actor_info(name, ptype, refresh), ensure_ascii=False)
+            return self._send_json(200, out)
+        if self.path.split('?', 1)[0] == '/__actor-pic':
+            # 头像中转：与 /__subtitle-file 同理，前端 relayFetch 携带令牌取 blob 再挂 <img>
+            if not self._token_ok():
+                return self._send_json(403, json.dumps({'ok': False, 'error': 'forbidden: missing or invalid token'}))
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            u = (qs.get('u') or [''])[0]
+            raw, err = fetch_actor_pic(u)
+            if raw is None:
+                return self._send_json(400, json.dumps({'ok': False, 'error': err}, ensure_ascii=False))
+            magic = raw[:4].lower()
+            ctype = ('image/png' if magic.startswith(b'\x89png')
+                     else 'image/webp' if magic.startswith(b'riff')
+                     else 'image/jpeg')
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Cache-Control', 'private, max-age=86400')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                pass
+            return
         if self.path.split('?', 1)[0] == '/__trailer':
             # 与 /__magnets 同理：同源令牌防跨站滥用
             if not self._token_ok():
@@ -1413,6 +2232,25 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             try:
                 self.wfile.write(data)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                pass
+            return
+        if self.path.split('?', 1)[0] == '/__online-ts':
+            # 备用源分段中转（同源令牌 + 白名单登记地址，非白名单一律拒绝）
+            if not self._token_ok():
+                return self._send_json(403, json.dumps({'ok': False, 'error': 'forbidden: missing or invalid token'}))
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            u = (qs.get('u') or [''])[0]
+            raw, err = proxy_online_segment(u)
+            if raw is None:
+                return self._send_json(400, json.dumps({'ok': False, 'error': err}, ensure_ascii=False))
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/mp2t')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            try:
+                self.wfile.write(raw)
             except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
                 pass
             return
@@ -1542,6 +2380,9 @@ if __name__ == '__main__':
     else:
         log('未配置智谱 API Key（avdanyu-data/zhipu-config.json 或环境变量 ZHIPU_API_KEY），翻译使用免费谷歌引擎')
     log('翻译引擎优先级：智谱 GLM → 谷歌免费端点 → MyMemory（单条兜底）')
+    # 后台预热 gfriends 头像索引（约 6.5MB）；加载/构建 minnano 演员名索引（首次约 5-10 分钟，增量可用）
+    threading.Timer(8, _gfriends_prewarm).start()
+    _minnano_init()
     try:
         srv = SafeHTTPServer(('127.0.0.1', PORT), Handler)
         log(f'服务器已启动 http://127.0.0.1:{PORT}/avdanyu-viewer.html')

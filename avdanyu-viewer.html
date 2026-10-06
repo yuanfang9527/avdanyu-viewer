@@ -209,9 +209,6 @@
   #online-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   #online-title { color: var(--text); font-size: 14px; flex: 1; min-width: 0; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
-  #online-cn { flex: 0 0 auto; font-size: 11px; font-weight: 700; color: var(--accent2);
-    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 1px 7px; }
-  #online-cn[hidden] { display: none; }
   #online-srcs { display: inline-flex; gap: 5px; flex: 0 0 auto; }
   #online-srcs[hidden] { display: none; }
   #online-srcs button { background: var(--panel2); color: var(--muted); border: 1px solid var(--line);
@@ -453,6 +450,31 @@
   .aexp .badge { cursor: pointer; font-size: 11.5px; }
   .aexp .badge:hover { border-color: var(--accent); color: var(--accent); }
   .aexp-row td { background: var(--panel2); }
+
+  /* ---------- 演员个人信息（外站抓取：JavBus 字段 + JavDB 别名/社链 + gfriends 头像） ---------- */
+  #drawer .actor-info { display: flex; gap: 12px; margin: 12px 0 2px; padding: 10px 12px;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+    align-items: flex-start; min-height: 40px; }
+  #drawer .actor-info .ai-photo { flex: none; width: 72px; height: 96px; border-radius: 8px;
+    object-fit: cover; object-position: top; background: var(--panel); border: 1px solid var(--line); }
+  #drawer .actor-info .ai-body { flex: 1; min-width: 0; display: flex; flex-direction: column;
+    gap: 7px; justify-content: center; }
+  #drawer .ai-fields { display: flex; flex-wrap: wrap; gap: 5px 6px; }
+  #drawer .ai-field { font-size: 12px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 8px; white-space: nowrap; }
+  #drawer .ai-field b { color: var(--accent2); font-weight: 600; margin-right: 4px; }
+  #drawer .ai-alias { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap;
+    gap: 4px; align-items: baseline; }
+  #drawer .ai-aka { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 1px 7px; font-size: 11.5px; color: var(--text); }
+  #drawer .ai-links { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #drawer .ai-links a { font-size: 12px; color: var(--accent2); text-decoration: none; }
+  #drawer .ai-links a:hover { text-decoration: underline; }
+  #drawer .ai-status { font-size: 12px; color: var(--muted); }
+  #drawer .ai-warn { font-size: 11px; color: var(--faint); max-width: 100%; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  #drawer .ai-refresh { padding: 2px 10px; font-size: 11.5px; }
+  @media (max-width: 500px) { #drawer .actor-info .ai-photo { width: 60px; height: 80px; } }
 
   /* ---------- 搜索框宽度：監督起统一缩窄 1/4（128 → 96） ---------- */
   #s-director, #s-maker, #s-label, #s-series, #s-genre { width: 96px; }
@@ -829,7 +851,6 @@
   <div id="online-box">
     <div id="online-head">
       <strong id="online-title">在线播放</strong>
-      <span id="online-cn" hidden title="该片源带中文字幕（多版本时已优先选择）">中字</span>
       <span id="online-srcs" hidden></span>
       <button id="online-sub-btn" type="button" title="搜索并挂载字幕（迅雷字幕库·网友上传）">字幕</button>
       <button class="rowbtn" id="online-close" type="button">✕ 关闭</button>
@@ -852,7 +873,7 @@
     <div id="online-foot">
       <span id="online-status">正在解析播放源…</span>
       <span class="online-links">
-        <a id="online-search" href="#" target="_blank" rel="noopener noreferrer">在 javday 搜索番号 ↗</a>
+        <a id="online-search" href="#" target="_blank" rel="noopener noreferrer">站内搜索番号 ↗</a>
         <a id="online-open" href="#" target="_blank" rel="noopener noreferrer">新标签页打开 ↗</a>
       </span>
     </div>
@@ -3424,11 +3445,14 @@ function openActorDrawer(name, ptype, pushHistory = false) {
       <span class="chip">全库作品 <b>${counts[name] || 0}</b> 部</span>
       ${fav && fav.at ? `<span class="chip">收藏于 ${fmtD(fav.at)}</span>` : ''}
     </div>
+    <section class="actor-info" id="d-actorinfo"><div class="ai-status">正在获取个人信息…</div></section>
     <div class="ext-links" style="margin-top:10px;">
       <button class="extbtn tr" id="da-pick">查看 TA 的作品</button>
       <button class="extbtn src" id="da-unfav">${fav && fav.at ? '★ 已收藏（点击取消）' : '☆ 收藏'}</button>
     </div>
     ${groupsHtml}`;
+
+  loadActorInfo(name, ptype);
 
   const daPick = document.getElementById('da-pick');
   if (daPick) {
@@ -3596,6 +3620,153 @@ function openActorDrawer(name, ptype, pushHistory = false) {
 
   drawer.classList.add('on');
   drawerMask.classList.add('on');
+}
+
+/* ---------- 演员个人信息：打开演员抽屉即经本地服务器抓取（JavBus 主数据 + JavDB 别名/社链
+   + gfriends 头像库）。前端内存缓存（key = ptype:名字，含已取到的头像 blob URL），
+   命中不再请求；服务端另有 6 小时缓存与 refresh=1 强制刷新。 ---------- */
+const _actorInfoCache = new Map();     // key -> { data, photoURL }
+let _actorInfoSeq = 0;                 // 防竞态：只渲染最后一次请求
+
+function actorInfoKey(name, ptype) { return (ptype === 'm' ? 'm:' : 'f:') + name; }
+
+async function actorInfoPhotoURL(photoList) {
+  // 头像候选依次尝试（gfriends 质量优先，JavBus/JavDB 兜底）；外站有防盗链，
+  // 浏览器直连会挂，经本地服务器中转取 blob 再挂（img 标签带不了鉴权头）
+  const urls = Array.isArray(photoList) && photoList.length ? photoList : (photoList ? [photoList] : []);
+  for (const u of urls) {
+    try {
+      const resp = await relayFetch('/__actor-pic?u=' + encodeURIComponent(u), {}, 15000);
+      if (!resp || !resp.ok) continue;
+      const blob = await resp.blob();
+      if (!blob.type.startsWith('image/')) continue;
+      return URL.createObjectURL(blob);
+    } catch (e) { /* 试下一张 */ }
+  }
+  return '';
+}
+
+function actorInfoFieldsHTML(data) {
+  const fields = (data.fields || []).map(f => [String(f[0] || ''), String(f[1] || '')]).filter(f => f[0] && f[1]);
+  // 三围三行齐全时合并为一行（胸圍 85cm / 腰圍 59cm / 臀圍 91cm -> 三圍 B85 / W59 / H91），插到身高后
+  const idx = ['胸圍', '腰圍', '臀圍'].map(k => fields.findIndex(f => f[0] === k));
+  if (idx.every(i => i >= 0)) {
+    const bwh = idx.map(i => fields[i][1].replace(/\s*cm/i, '').trim());
+    for (let i = idx.length - 1; i >= 0; i--) fields.splice(idx[i], 1);
+    const hi = fields.findIndex(f => f[0] === '身高');
+    fields.splice(hi >= 0 ? hi + 1 : 0, 0, ['三圍', `B${bwh[0]} / W${bwh[1]} / H${bwh[2]}`]);
+  }
+  return fields.map(([k, v]) => `<span class="ai-field"><b>${esc(k)}</b>${esc(v)}</span>`).join('');
+}
+
+function actorInfoHTML(data, photoURL) {
+  if (data.notFound) {
+    const photo = photoURL ? `<img class="ai-photo" src="${esc(photoURL)}" alt="头像">` : '';
+    const warn = data.warn ? `<div class="ai-warn">（${esc(data.warn)}）</div>` : '';
+    return `${photo}<div class="ai-body">
+      <div class="ai-status">JavBus / JavDB 未收录该演员的资料${warn}</div>
+      <div class="ai-links"><button class="sec rowbtn ai-refresh" id="d-actorinfo-refresh" type="button" title="强制重新抓取外站资料">重新抓取</button></div>
+    </div>`;
+  }
+  const photo = photoURL ? `<img class="ai-photo" src="${esc(photoURL)}" alt="头像">` : '';
+  const fields = actorInfoFieldsHTML(data);
+  const aliases = (data.aliases || []).length
+    ? `<div class="ai-alias">别名：${data.aliases.map(a => `<span class="ai-aka">${esc(a)}</span>`).join('')}</div>` : '';
+  const works = data.works ? `<span class="chip">外站收录 <b>${data.works}</b> 部</span>` : '';
+  const src = data.sources || {};
+  const links = [
+    data.twitter ? `<a href="${esc(data.twitter)}" target="_blank" rel="noopener">🐦 Twitter</a>` : '',
+    data.instagram ? `<a href="${esc(data.instagram)}" target="_blank" rel="noopener">📷 Instagram</a>` : '',
+    src.minnano ? `<a href="${esc(src.minnano)}" target="_blank" rel="noopener" title="みんなのAV（字段优先源，数字采用事务所/厂商官方口径）">みんなのAV ↗</a>` : '',
+    src['sexy-profile'] ? `<a href="${esc(src['sexy-profile'])}" target="_blank" rel="noopener" title="sexy-profile 汇总库">sexy-profile ↗</a>` : '',
+    src.javbus ? `<a href="${esc(src.javbus)}" target="_blank" rel="noopener">JavBus ↗</a>` : '',
+    src.javdb ? `<a href="${esc(src.javdb)}" target="_blank" rel="noopener">JavDB ↗</a>` : '',
+  ].filter(Boolean).join('');
+  const warn = data.warn ? `<div class="ai-warn" title="${esc(data.warn)}">部分数据源不可用</div>` : '';
+  const refresh = `<button class="sec rowbtn ai-refresh" id="d-actorinfo-refresh" type="button" title="强制重新抓取外站资料">重新抓取</button>`;
+  return `${photo}
+    <div class="ai-body">
+      ${fields ? `<div class="ai-fields">${fields}</div>` : '<div class="ai-status">外站未登记身高/三围等资料</div>'}
+      ${aliases}${works}
+      <div class="ai-links">${links}${warn}${refresh}</div>
+    </div>`;
+}
+
+async function loadActorInfo(name, ptype, force = false) {
+  const box = document.getElementById('d-actorinfo');
+  if (!box) return;
+  const seq = ++_actorInfoSeq;
+  const stillCurrent = () => {
+    const st = _currentDrawerState;
+    return seq === _actorInfoSeq && st && st.type === 'actor' && st.name === name && st.ptype === ptype
+      && document.getElementById('d-actorinfo') === box;
+  };
+  const key = actorInfoKey(name, ptype);
+
+  const render = (entry, cachedPhoto) => {
+    if (!stillCurrent()) return;
+    const data = entry.data;
+    // 有头像先渲染正文（占位头像随后补），避免等图片拖住整块
+    box.innerHTML = actorInfoHTML(data, cachedPhoto || '');
+    if (cachedPhoto) return;
+    if (data.photo || (data.photos && data.photos.length)) {
+      actorInfoPhotoURL(data.photos || data.photo).then(url => {
+        if (!url || !stillCurrent()) {
+          if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
+          return;
+        }
+        entry.photoURL = url;   // 记入缓存，重开抽屉免再取
+        const img = document.createElement('img');
+        img.className = 'ai-photo';
+        img.src = url;
+        img.alt = '头像';
+        box.prepend(img);
+      });
+    }
+  };
+
+  if (!force) {
+    const hit = _actorInfoCache.get(key);
+    if (hit) { render(hit, hit.photoURL); return; }
+  }
+
+  if (force) {
+    box.innerHTML = `<div class="ai-status">正在重新抓取…</div>
+      <button class="sec rowbtn ai-refresh" id="d-actorinfo-refresh" disabled>重新抓取</button>`;
+  }
+  try {
+    const resp = await relayFetch(`/__actor-info?name=${encodeURIComponent(name)}&ptype=${ptype}${force ? '&refresh=1' : ''}`,
+      {}, 45000);
+    if (!stillCurrent()) return;
+    if (!resp) {
+      box.innerHTML = '<div class="ai-status">个人信息接口不可用：请通过 start-viewer.bat（scripts/avdanyu-server.py）启动查看器。</div>';
+      return;
+    }
+    if (resp.status === 403) {
+      box.innerHTML = '<div class="ai-status">个人信息接口鉴权失败：请刷新页面后重试。</div>';
+      return;
+    }
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    if (!stillCurrent()) return;
+    if (!data.ok) {
+      box.innerHTML = `<div class="ai-status">个人信息抓取失败：${esc(data.error || '未知错误')}</div>
+        <button class="sec rowbtn ai-refresh" id="d-actorinfo-refresh" type="button">重试</button>`;
+    } else {
+      const old = _actorInfoCache.get(key);
+      if (old && old.photoURL) { try { URL.revokeObjectURL(old.photoURL); } catch (e) {} }
+      const entry = { data, photoURL: '' };
+      _actorInfoCache.set(key, entry);
+      render(entry);
+    }
+  } catch (e) {
+    if (!stillCurrent()) return;
+    box.innerHTML = `<div class="ai-status">个人信息加载失败：${esc(String(e.message || e))}</div>
+      <button class="sec rowbtn ai-refresh" id="d-actorinfo-refresh" type="button">重试</button>`;
+    return;
+  }
+  const btn = document.getElementById('d-actorinfo-refresh');
+  if (btn) btn.addEventListener('click', () => loadActorInfo(name, ptype, true));
 }
 
 const TYPE_CONFIG = {
@@ -4662,8 +4833,6 @@ function openOnlinePlayer(code, title) {
   document.getElementById('online-open').href = onlineSearchUrl(code);
   const srcs = document.getElementById('online-srcs');
   if (srcs) { srcs.innerHTML = ''; srcs.hidden = true; }
-  const cn = document.getElementById('online-cn');
-  if (cn) cn.hidden = true;
   video.volume = 0.3;          // 默认音量 30%，仍可用播放器音量条调节
   video.removeAttribute('poster');
   destroyOnlineHls();
@@ -4690,8 +4859,6 @@ async function resolveOnlinePlayer(code) {
     return;
   }
   _onlineSources = data.sources;
-  const cn = document.getElementById('online-cn');
-  if (cn) cn.hidden = !data.cnSub;   // 中字片源标记（多版本时服务器已优先选择）
   const video = document.getElementById('online-video');
   if (video && data.poster) {
     video.poster = data.poster;   // 视频页封面，加载前先显示
@@ -4699,6 +4866,8 @@ async function resolveOnlinePlayer(code) {
   }
   const open = document.getElementById('online-open');
   if (open && data.pageUrl) open.href = data.pageUrl;   // 解析到视频页后「新标签页打开」直达
+  const search = document.getElementById('online-search');
+  if (search && data.searchUrl) search.href = data.searchUrl;   // 搜索链接跟随实际命中的源站
   renderOnlineSources();
   if (status) status.textContent = '';   // 解析成功后不显示提示文案，画面只留视频
   playOnlineSource(0);
